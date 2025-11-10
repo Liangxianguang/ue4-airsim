@@ -1,0 +1,8 @@
+output/*
+.vs/*
+Binaries/*
+Content/*
+DerivedDataCache/*
+Intermediate/*
+Saved/*
+Plugins/*

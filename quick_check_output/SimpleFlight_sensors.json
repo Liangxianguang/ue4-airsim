@@ -1,0 +1,133 @@
+{
+    "state": {
+        "collision": {
+            "has_collided": false,
+            "penetration_depth": 0.0,
+            "time_stamp": 0,
+            "normal": {
+                "x_val": 0.0,
+                "y_val": 0.0,
+                "z_val": 0.0
+            },
+            "impact_point": {
+                "x_val": 0.0,
+                "y_val": 0.0,
+                "z_val": 0.0
+            },
+            "position": {
+                "x_val": 0.0,
+                "y_val": 0.0,
+                "z_val": 0.0
+            },
+            "object_name": "",
+            "object_id": -1
+        },
+        "kinematics_estimated": {
+            "position": {
+                "x_val": 0.0,
+                "y_val": 0.0,
+                "z_val": 2.8721609115600586
+            },
+            "orientation": {
+                "w_val": 0.9999998807907104,
+                "x_val": 0.0,
+                "y_val": 0.0,
+                "z_val": 0.0
+            },
+            "linear_velocity": {
+                "x_val": 0.0,
+                "y_val": 0.0,
+                "z_val": 0.0
+            },
+            "angular_velocity": {
+                "x_val": 0.0,
+                "y_val": 0.0,
+                "z_val": 0.0
+            },
+            "linear_acceleration": {
+                "x_val": 0.0,
+                "y_val": 0.0,
+                "z_val": 0.0
+            },
+            "angular_acceleration": {
+                "x_val": 0.0,
+                "y_val": 0.0,
+                "z_val": 0.0
+            }
+        },
+        "gps_location": {
+            "latitude": 47.6414680567672,
+            "longitude": -122.14016504841084,
+            "altitude": 119.12808227539062
+        },
+        "timestamp": 1762247119616873728,
+        "landed_state": 0,
+        "rc_data": {
+            "timestamp": 0,
+            "pitch": 0.0,
+            "roll": 0.0,
+            "throttle": 0.0,
+            "yaw": 0.0,
+            "left_z": 0.0,
+            "right_z": 0.0,
+            "switches": 0,
+            "vendor_id": "",
+            "is_initialized": false,
+            "is_valid": false
+        }
+    },
+    "imu": {
+        "time_stamp": 1762247119616873728,
+        "orientation": {
+            "w_val": 0.9999998807907104,
+            "x_val": 0.0,
+            "y_val": 0.0,
+            "z_val": 0.0
+        },
+        "angular_velocity": {
+            "x_val": 0.000491954677272588,
+            "y_val": -0.0011658010771498084,
+            "z_val": -0.000898011086974293
+        },
+        "linear_acceleration": {
+            "x_val": 0.039011500775814056,
+            "y_val": 0.04963412508368492,
+            "z_val": -9.757657051086426
+        }
+    },
+    "barometer": {
+        "time_stamp": 1762247119607873536,
+        "altitude": 118.7262954711914,
+        "pressure": 99906.2421875,
+        "qnh": 1013.25
+    },
+    "magnetometer": {
+        "time_stamp": 1762247119607873536,
+        "magnetic_field_body": {
+            "x_val": 0.2543775737285614,
+            "y_val": 0.04276711866259575,
+            "z_val": 0.35694995522499084
+        },
+        "magnetic_field_covariance": []
+    },
+    "gps": {
+        "time_stamp": 1762247119391868928,
+        "gnss": {
+            "geo_point": {
+                "latitude": 47.6414680567672,
+                "longitude": -122.14016504841084,
+                "altitude": 119.12808227539062
+            },
+            "eph": 0.10000111907720566,
+            "epv": 0.10000111907720566,
+            "velocity": {
+                "x_val": 0.0,
+                "y_val": 0.0,
+                "z_val": 0.0
+            },
+            "fix_type": 3,
+            "time_utc": 1762247119391869
+        },
+        "is_valid": true
+    }
+}
