@@ -24,6 +24,8 @@ OBSERVER_VEHICLE_NAME = "Observer"  # 外部摄像机在 settings.json 中的名
 OBSERVER_COMPRESS = True             # 为Observer使用压缩图，降低高分辨率下的带宽与拷贝开销
 OBSERVER_DEDICATED_THREAD = True     # 为Observer启用专用采集+编码线程，获得更稳定的“相机式”录制
 OBSERVER_FPS = 60                    # Observer 专用恒定输出帧率（建议高于/等于 CAPTURE_FPS）
+ENABLE_DEPTH_SEGMENTATION = False    # 启用深度图和分割掩码采集（仅对Observer有效）
+ENABLE_DRONE_DEPTH_SEGMENTATION = False  # 启用无人机深度图和分割掩码采集（会显著增加数据量）
 
 # Observer 缩放/距离控制（解决“越拍越远”）：
 # lock: 固定距离与高度
@@ -67,6 +69,12 @@ SENSOR_LOG_EVERY_N = 5
 # 是否保存 Observer 的视频
 SAVE_OBSERVER_VIDEO = True
 
+# 拦截跟踪相关配置
+ENABLE_BBOX_ANNOTATION = True       # 启用边界框标注功能
+ENABLE_DEPTH_SEGMENTATION = True   # 启用深度图和分割掩码采集
+BBOX_LOG_EVERY_N = 1               # 边界框标注记录频率（每N帧记录一次）
+DRONE_BBOX_SIZE = (2.0, 2.0, 1.0)  # 无人机边界框尺寸 (长x宽x高)，单位米
+
 import math
 # 自动生成复杂轨迹（圆形、螺旋、S型、交错等）
 def generate_path(pattern, center, radius, alt, num_points=40):
@@ -74,31 +82,196 @@ def generate_path(pattern, center, radius, alt, num_points=40):
     if pattern == "circle":
         for i in range(num_points):
             theta = 2 * math.pi * i / num_points
-            x = center[0] + radius * math.cos(theta)
-            y = center[1] + radius * math.sin(theta)
-            path.append((x, y, alt))
+            x = float(center[0] + radius * math.cos(theta))
+            y = float(center[1] + radius * math.sin(theta))
+            path.append((x, y, float(alt)))
     elif pattern == "spiral":
         for i in range(num_points):
             r = radius * (i / num_points)
             theta = 4 * math.pi * i / num_points
-            x = center[0] + r * math.cos(theta)
-            y = center[1] + r * math.sin(theta)
-            z = alt + i * 0.2  # 螺旋上升
+            x = float(center[0] + r * math.cos(theta))
+            y = float(center[1] + r * math.sin(theta))
+            z = float(alt + i * 0.2)  # 螺旋上升
             path.append((x, y, z))
     elif pattern == "sine":
         for i in range(num_points):
-            x = center[0] + i * radius / num_points
-            y = center[1] + math.sin(i * 2 * math.pi / num_points) * radius / 2
-            path.append((x, y, alt))
+            x = float(center[0] + i * radius / num_points)
+            y = float(center[1] + math.sin(i * 2 * math.pi / num_points) * radius / 2)
+            path.append((x, y, float(alt)))
     elif pattern == "zigzag":
         for i in range(num_points):
-            x = center[0] + i * radius / num_points
-            y = center[1] + (radius if i % 2 == 0 else -radius)
-            path.append((x, y, alt))
+            x = float(center[0] + i * radius / num_points)
+            y = float(center[1] + (radius if i % 2 == 0 else -radius))
+            path.append((x, y, float(alt)))
+    elif pattern == "evasive":  # 规避机动 - 急转弯 + 随机扰动
+        for i in range(num_points):
+            base_angle = 6 * math.pi * i / num_points  # 快速转向
+            noise_x = float(np.random.uniform(-radius*0.3, radius*0.3))  # 随机扰动
+            noise_y = float(np.random.uniform(-radius*0.3, radius*0.3))
+            x = float(center[0] + radius * math.cos(base_angle) + noise_x)
+            y = float(center[1] + radius * math.sin(base_angle) + noise_y)
+            z = float(alt + np.random.uniform(-1, 1))  # 高度随机变化
+            path.append((x, y, z))
+    elif pattern == "intercept":  # 拦截轨迹 - 高速直线冲刺
+        for i in range(num_points):
+            progress = i / (num_points - 1)
+            # 加速段 + 匀速段 + 减速段
+            if progress < 0.3:
+                speed_factor = progress / 0.3  # 加速
+            elif progress > 0.7:
+                speed_factor = (1 - progress) / 0.3  # 减速
+            else:
+                speed_factor = 1.0  # 匀速
+            
+            x = float(center[0] + radius * 2 * progress)  # 直线运动
+            y = float(center[1] + math.sin(progress * math.pi) * radius * 0.2)  # 轻微摆动
+            z = float(alt - progress * radius * 0.1)  # 轻微俯冲
+            path.append((x, y, z))
+    elif pattern == "swarm_break":  # 编队解散 - 从集中到分散
+        for i in range(num_points):
+            progress = i / (num_points - 1)
+            spread_factor = progress * 2.0  # 逐渐分散
+            angle = 2 * math.pi * i / num_points
+            x = float(center[0] + radius * spread_factor * math.cos(angle))
+            y = float(center[1] + radius * spread_factor * math.sin(angle))
+            z = float(alt + spread_factor * radius * 0.1)
+            path.append((x, y, z))
+    elif pattern == "combat_turn":  # 战斗转弯 - 高G机动
+        for i in range(num_points):
+            # 紧急转弯，高角速度
+            theta = 8 * math.pi * i / num_points  
+            # 模拟高G转弯的轨迹特征
+            turn_radius = radius * (0.5 + 0.5 * math.sin(4 * math.pi * i / num_points))
+            x = float(center[0] + turn_radius * math.cos(theta))
+            y = float(center[1] + turn_radius * math.sin(theta))
+            z = float(alt + math.sin(theta) * radius * 0.15)  # 垂直机动
+            path.append((x, y, z))
     else:
         for i in range(num_points):
-            path.append((center[0] + i, center[1], alt))
+            path.append((float(center[0] + i), float(center[1]), float(alt)))
     return path
+
+# 3D坐标转换为Observer相机的2D边界框
+def project_3d_to_2d_bbox(world_pos, world_size, observer_pose, camera_fov, img_width, img_height):
+    """
+    将3D世界坐标中的无人机投影到Observer摄像头的2D图像坐标系
+    
+    Args:
+        world_pos: 无人机在世界坐标系中的位置 (x, y, z)
+        world_size: 无人机在世界坐标系中的尺寸 (width, height, depth)
+        observer_pose: Observer摄像头的位姿信息
+        camera_fov: 相机FOV角度（度）
+        img_width, img_height: 图像尺寸
+        
+    Returns:
+        bbox_2d: (x_min, y_min, x_max, y_max) 或 None（如果不在视野内）
+        visibility: 可见性评分 0.0-1.0
+        distance: 距离观察者的距离
+    """
+    try:
+        # 相机位置和朝向
+        cam_pos = observer_pose.position
+        cam_orientation = observer_pose.orientation
+        
+        # 计算无人机相对于相机的位置向量
+        rel_pos = (
+            world_pos[0] - cam_pos.x_val,
+            world_pos[1] - cam_pos.y_val, 
+            world_pos[2] - cam_pos.z_val
+        )
+        
+        # 转换到相机坐标系（简化处理，假设相机朝向+X）
+        # 在实际应用中需要考虑四元数旋转
+        distance = float(math.sqrt(rel_pos[0]**2 + rel_pos[1]**2 + rel_pos[2]**2))
+        
+        if distance < 1.0:  # 太近时跳过
+            return None, 0.0, distance
+            
+        # 计算水平和垂直视角
+        fov_rad = math.radians(camera_fov)
+        focal_length = img_width / (2 * math.tan(fov_rad / 2))
+        
+        # 投影到2D（简化投影模型）
+        if rel_pos[0] <= 0:  # 在相机后方
+            return None, 0.0, distance
+            
+        # 2D投影坐标
+        proj_x = focal_length * rel_pos[1] / rel_pos[0] + img_width / 2
+        proj_y = focal_length * (-rel_pos[2]) / rel_pos[0] + img_height / 2
+        
+        # 根据距离和无人机尺寸计算边界框
+        apparent_size_x = focal_length * world_size[0] / rel_pos[0]
+        apparent_size_y = focal_length * world_size[1] / rel_pos[0]
+        
+        # 边界框坐标
+        x_min = float(max(0, proj_x - apparent_size_x / 2))
+        y_min = float(max(0, proj_y - apparent_size_y / 2))
+        x_max = float(min(img_width - 1, proj_x + apparent_size_x / 2))
+        y_max = float(min(img_height - 1, proj_y + apparent_size_y / 2))
+        
+        # 检查是否在图像范围内
+        if x_max <= x_min or y_max <= y_min:
+            return None, 0.0, float(distance)
+            
+        # 可见性评分（基于边界框在图像中的比例和距离）
+        bbox_area = (x_max - x_min) * (y_max - y_min)
+        img_area = img_width * img_height
+        area_ratio = min(1.0, bbox_area / (img_area * 0.01))  # 最小1%面积才算可见
+        distance_factor = min(1.0, 100.0 / distance)  # 距离因子
+        visibility = float(area_ratio * distance_factor)
+        
+        return (int(x_min), int(y_min), int(x_max), int(y_max)), visibility, float(distance)
+        
+    except Exception as e:
+        print(f"Projection error: {e}")
+        return None, 0.0, 0.0
+
+# 计算集群相对运动特征
+def compute_swarm_dynamics(poses, velocities=None):
+    """
+    计算无人机集群的动力学特征
+    
+    Returns:
+        dict: 包含质心、分散度、密集度、相对速度等信息
+    """
+    if not poses or len(poses) < 2:
+        return {}
+        
+    # 质心和基本几何特征
+    center, radius = compute_swarm_center_and_radius(poses)
+    
+    # 计算分散度（标准差）
+    positions = np.array([[p.position.x_val, p.position.y_val, p.position.z_val] for p in poses])
+    dispersion = np.std(positions, axis=0)  # 每个轴的分散度
+    avg_dispersion = float(np.mean(dispersion))
+    
+    # 密集度（相对于边界框的填充率）
+    if len(poses) > 1:
+        bbox_volume = (np.max(positions, axis=0) - np.min(positions, axis=0))
+        bbox_vol = float(np.prod(bbox_volume + 1e-6))  # 避免除零
+        density = float(len(poses) / bbox_vol) if bbox_vol > 0 else 0.0
+    else:
+        density = 0.0
+    
+    # 相对距离矩阵
+    relative_distances = []
+    for i in range(len(positions)):
+        for j in range(i+1, len(positions)):
+            dist = float(np.linalg.norm(positions[i] - positions[j]))
+            relative_distances.append(dist)
+    
+    dynamics = {
+        'center': center,
+        'radius': radius,
+        'dispersion': avg_dispersion,
+        'density': density,
+        'num_drones': len(poses),
+        'min_distance': float(min(relative_distances)) if relative_distances else 0.0,
+        'max_distance': float(max(relative_distances)) if relative_distances else 0.0,
+        'avg_distance': float(np.mean(relative_distances)) if relative_distances else 0.0
+    }
+    
+    return dynamics
 
 # 计算无人机集群的质心与范围（最大半径）
 def compute_swarm_center_and_radius(poses):
@@ -276,12 +449,12 @@ def update_observer_camera(client, vehicles, strength=2.0):
         # 忽略任何单次更新异常，保持主流程稳定
         pass
 
-# 为每架机分配不同轨迹
+# 为每架机分配不同轨迹 - 针对拦截场景优化
 PATHS = {
-    "Drone1": generate_path("circle", center=(5, 0), radius=10, alt=FLIGHT_ALT, num_points=60),
-    "Drone2": generate_path("spiral", center=(5, 0), radius=15, alt=FLIGHT_ALT, num_points=60),
-    "Drone3": generate_path("sine", center=(0, 8), radius=15, alt=FLIGHT_ALT, num_points=60),
-    "Drone4": generate_path("zigzag", center=(8, 0), radius=10, alt=FLIGHT_ALT, num_points=60)
+    "Drone1": generate_path("evasive", center=(5, 0), radius=12, alt=FLIGHT_ALT, num_points=80),      # 规避机动
+    "Drone2": generate_path("intercept", center=(0, 5), radius=20, alt=FLIGHT_ALT, num_points=60),    # 拦截轨迹  
+    "Drone3": generate_path("combat_turn", center=(-5, 8), radius=15, alt=FLIGHT_ALT, num_points=70), # 战斗转弯
+    "Drone4": generate_path("swarm_break", center=(8, -5), radius=10, alt=FLIGHT_ALT, num_points=60)  # 编队解散
 }
 
 # --- 全局变量 ---
@@ -299,6 +472,24 @@ CSV_HEADERS = [
     "baro_altitude", "baro_pressure",
     "mag_x", "mag_y", "mag_z"
 ]
+
+# Observer视角的边界框标注CSV头部
+OBSERVER_BBOX_HEADERS = [
+    "timestamp_utc", "timestamp_ms", "frame_idx",
+    "swarm_center_x", "swarm_center_y", "swarm_center_z",
+    "swarm_radius", "swarm_dispersion", "swarm_density", "swarm_num_drones",
+    "swarm_min_distance", "swarm_max_distance", "swarm_avg_distance"
+]
+
+# 为每架无人机动态添加边界框字段
+def get_observer_bbox_headers_with_drones(vehicle_names):
+    headers = OBSERVER_BBOX_HEADERS.copy()
+    for v in vehicle_names:
+        headers.extend([
+            f"{v}_bbox_x_min", f"{v}_bbox_y_min", f"{v}_bbox_x_max", f"{v}_bbox_y_max",
+            f"{v}_visibility", f"{v}_distance", f"{v}_world_x", f"{v}_world_y", f"{v}_world_z"
+        ])
+    return headers
 
 # --- Observer 专用线程的共享状态 ---
 observer_stop_event = None
@@ -322,6 +513,9 @@ obs_last_t = None
 swarm_center_ema = None
 swarm_radius_ema = None
 obs_fov_deg = None
+
+# 视频文件路径存储（用于多模态编码器）
+video_paths = {}
 
 # --- 函数 ---
 
@@ -348,7 +542,7 @@ def initialize_client():
         if v not in PATHS:
             template = list(PATHS.values())[0] if PATHS else [(10, 0, FLIGHT_ALT)]
             # 修复：确保备用路径是元组列表，而不是Vector3r对象列表
-            PATHS[v] = [(p[0] + np.random.uniform(-5, 5), p[1] + np.random.uniform(-5, 5), p[2]) for p in template]
+            PATHS[v] = [(float(p[0] + np.random.uniform(-5, 5)), float(p[1] + np.random.uniform(-5, 5)), float(p[2])) for p in template]
             print(f"Created fallback path for {v}")
 
 def ensure_dirs():
@@ -361,13 +555,29 @@ def ensure_dirs():
             os.makedirs(os.path.join(OUT_DIR, OBSERVER_VEHICLE_NAME, subdir), exist_ok=True)
 
 def initialize_recorders(img_size=(640, 480), observer_img_size=None):
+    global video_paths
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     for v in VEHICLES:
-        # Video Writer
+        # RGB Video Writer
         video_path = os.path.join(OUT_DIR, v, "videos", f"{v}_{ts}.mp4")
+        video_paths[v] = video_path
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         video_writers[v] = cv2.VideoWriter(video_path, fourcc, CAPTURE_FPS, img_size)
-        print(f"[{v}] Video writer initialized at {video_path}")
+        print(f"[{v}] RGB video writer initialized at {video_path}")
+        
+        # 多模态视频编码器（如果启用）
+        if ENABLE_DRONE_DEPTH_SEGMENTATION:
+            # 深度视频编码器 - 使用更兼容的编码器
+            depth_path = os.path.join(OUT_DIR, v, "videos", f"{v}_{ts}_depth.avi")
+            depth_fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+            video_writers[f"{v}_depth"] = cv2.VideoWriter(depth_path, depth_fourcc, CAPTURE_FPS, img_size, True)  # 3通道彩色（深度已转为BGR）
+            print(f"[{v}] Depth video writer initialized at {depth_path}")
+            
+            # 分割视频编码器 - 使用更兼容的编码器
+            seg_path = os.path.join(OUT_DIR, v, "videos", f"{v}_{ts}_segmentation.avi")
+            seg_fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+            video_writers[f"{v}_segmentation"] = cv2.VideoWriter(seg_path, seg_fourcc, CAPTURE_FPS, img_size)  # 彩色
+            print(f"[{v}] Segmentation video writer initialized at {seg_path}")
 
         # CSV Logger
         csv_path = os.path.join(OUT_DIR, v, "logs", f"{v}_{ts}.csv")
@@ -382,16 +592,26 @@ def initialize_recorders(img_size=(640, 480), observer_img_size=None):
         obs_size = observer_img_size if observer_img_size else img_size
         video_ext = ".avi"
         video_path = os.path.join(OUT_DIR, OBSERVER_VEHICLE_NAME, "videos", f"{OBSERVER_VEHICLE_NAME}_{ts}{video_ext}")
+        video_paths[OBSERVER_VEHICLE_NAME] = video_path
         fourcc = cv2.VideoWriter_fourcc(*'MJPG')
         video_writers[OBSERVER_VEHICLE_NAME] = cv2.VideoWriter(video_path, fourcc, OBSERVER_FPS, obs_size)
         print(f"[{OBSERVER_VEHICLE_NAME}] Video writer initialized at {video_path} (fps={OBSERVER_FPS})")
 
+        # Observer基础日志
         csv_path = os.path.join(OUT_DIR, OBSERVER_VEHICLE_NAME, "logs", f"{OBSERVER_VEHICLE_NAME}_{ts}.csv")
         csv_files[OBSERVER_VEHICLE_NAME] = open(csv_path, 'w', newline='', encoding='utf-8')
         csv_writers[OBSERVER_VEHICLE_NAME] = csv.writer(csv_files[OBSERVER_VEHICLE_NAME])
-        # 仅写通用头（没有机体状态可写时也能对齐时间戳）
         csv_writers[OBSERVER_VEHICLE_NAME].writerow(["timestamp_utc", "timestamp_ms", "frame_idx"]) 
         print(f"[{OBSERVER_VEHICLE_NAME}] CSV logger initialized at {csv_path}")
+        
+        # 边界框标注日志（用于目标检测训练）
+        if ENABLE_BBOX_ANNOTATION:
+            bbox_csv_path = os.path.join(OUT_DIR, OBSERVER_VEHICLE_NAME, "logs", f"{OBSERVER_VEHICLE_NAME}_bbox_{ts}.csv")
+            csv_files[f"{OBSERVER_VEHICLE_NAME}_bbox"] = open(bbox_csv_path, 'w', newline='', encoding='utf-8')
+            csv_writers[f"{OBSERVER_VEHICLE_NAME}_bbox"] = csv.writer(csv_files[f"{OBSERVER_VEHICLE_NAME}_bbox"])
+            bbox_headers = get_observer_bbox_headers_with_drones(VEHICLES)
+            csv_writers[f"{OBSERVER_VEHICLE_NAME}_bbox"].writerow(bbox_headers)
+            print(f"[{OBSERVER_VEHICLE_NAME}] Bbox annotation logger initialized at {bbox_csv_path}")
 
 def _observer_capture_loop(dt):
     global observer_latest_frame, observer_latest_ts
@@ -408,15 +628,52 @@ def _observer_capture_loop(dt):
             # 若本地客户端不可用则跳过本轮
             if local_client is None:
                 raise RuntimeError("Observer local AirSim client not available")
-            resp = local_client.simGetImages(
-                [airsim.ImageRequest(OBSERVER_CAMERA_NAME, airsim.ImageType.Scene, pixels_as_float=False, compress=OBSERVER_COMPRESS)],
-                vehicle_name=OBSERVER_VEHICLE_NAME
-            )
-            frame = frame_from_response(resp[0]) if (resp and resp[0]) else None
-            if frame is not None:
-                with observer_lock:
-                    observer_latest_frame = frame
-                    observer_latest_ts = datetime.datetime.now(datetime.timezone.utc)
+            
+            # 多模态图像采集：RGB + 深度 + 分割
+            image_requests = [
+                airsim.ImageRequest(OBSERVER_CAMERA_NAME, airsim.ImageType.Scene, pixels_as_float=False, compress=OBSERVER_COMPRESS),
+            ]
+            
+            if ENABLE_DEPTH_SEGMENTATION:
+                image_requests.extend([
+                    airsim.ImageRequest(OBSERVER_CAMERA_NAME, airsim.ImageType.DepthPerspective, pixels_as_float=True, compress=False),
+                    airsim.ImageRequest(OBSERVER_CAMERA_NAME, airsim.ImageType.Segmentation, pixels_as_float=False, compress=False)
+                ])
+            
+            resp = local_client.simGetImages(image_requests, vehicle_name=OBSERVER_VEHICLE_NAME)
+            
+            if resp and len(resp) > 0:
+                # RGB帧
+                rgb_frame = frame_from_response(resp[0]) if resp[0] else None
+                depth_frame = None
+                seg_frame = None
+                
+                if ENABLE_DEPTH_SEGMENTATION and len(resp) >= 3:
+                    # 深度图处理
+                    if resp[1] and resp[1].image_data_float:
+                        depth_data = np.array(resp[1].image_data_float, dtype=np.float32)
+                        depth_frame = depth_data.reshape(resp[1].height, resp[1].width)
+                        # 将深度转换为可视化图像（伪彩色）
+                        depth_normalized = np.clip(depth_frame / 100.0, 0, 1)  # 假设100米为最大深度
+                        depth_frame = (depth_normalized * 255).astype(np.uint8)
+                        # 确保深度图像是3通道的（复制灰度通道为RGB）
+                        if len(depth_frame.shape) == 2:
+                            depth_frame = cv2.cvtColor(depth_frame, cv2.COLOR_GRAY2BGR)
+                    
+                    # 分割掩码处理
+                    if resp[2]:
+                        seg_frame = frame_from_response(resp[2])
+                
+                if rgb_frame is not None:
+                    with observer_lock:
+                        # 存储多模态数据
+                        observer_latest_frame = {
+                            'rgb': rgb_frame,
+                            'depth': depth_frame,
+                            'segmentation': seg_frame,
+                            'timestamp': datetime.datetime.now(datetime.timezone.utc)
+                        }
+                        observer_latest_ts = observer_latest_frame['timestamp']
         except Exception:
             # 采集错误不致命，继续尝试
             pass
@@ -433,13 +690,65 @@ def _observer_encode_loop(dt):
     frame_idx = 0
     prev_frame = None
     next_t = time.perf_counter()
+    
+    # 为多模态数据创建额外的视频编码器
+    depth_writer = None
+    seg_writer = None
+    if ENABLE_DEPTH_SEGMENTATION and OBSERVER_VEHICLE_NAME in video_writers:
+        if OBSERVER_VEHICLE_NAME in video_paths:
+            base_path = os.path.splitext(video_paths[OBSERVER_VEHICLE_NAME])[0]
+            depth_path = f"{base_path}_depth.avi"
+            seg_path = f"{base_path}_segmentation.avi"
+            
+            # 获取Observer视频的尺寸信息
+            obs_size = (1280, 720)  # 默认Observer尺寸
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+            depth_writer = cv2.VideoWriter(depth_path, fourcc, OBSERVER_FPS, obs_size, True)  # 3通道彩色（深度已转为BGR）
+            seg_writer = cv2.VideoWriter(seg_path, fourcc, OBSERVER_FPS, obs_size)  # 彩色
+    
     while not observer_stop_event.is_set():
         # 使用最新帧；若暂无新帧则复用上一帧，保证CFR输出
         with observer_lock:
-            frame = observer_latest_frame if observer_latest_frame is not None else prev_frame
-        if frame is not None and OBSERVER_VEHICLE_NAME in video_writers:
-            video_writers[OBSERVER_VEHICLE_NAME].write(frame)
-            prev_frame = frame
+            frame_data = observer_latest_frame if observer_latest_frame is not None else prev_frame
+            
+        if frame_data is not None:
+            # 处理RGB帧
+            if isinstance(frame_data, dict) and 'rgb' in frame_data:
+                rgb_frame = frame_data['rgb']
+                depth_frame = frame_data.get('depth')
+                seg_frame = frame_data.get('segmentation')
+            else:
+                # 兼容旧格式（直接是numpy数组）
+                rgb_frame = frame_data
+                depth_frame = None
+                seg_frame = None
+            
+            # 写入RGB视频
+            if rgb_frame is not None and OBSERVER_VEHICLE_NAME in video_writers:
+                video_writers[OBSERVER_VEHICLE_NAME].write(rgb_frame)
+                
+            # 写入深度视频
+            if depth_frame is not None and depth_writer is not None:
+                # 确保尺寸匹配
+                if depth_frame.shape[:2] == (720, 1280):  # (height, width)
+                    depth_writer.write(depth_frame)
+                else:
+                    # 调整尺寸
+                    depth_resized = cv2.resize(depth_frame, (1280, 720))
+                    depth_writer.write(depth_resized)
+                
+            # 写入分割视频
+            if seg_frame is not None and seg_writer is not None:
+                # 确保尺寸匹配
+                if seg_frame.shape[:2] == (720, 1280):  # (height, width)
+                    seg_writer.write(seg_frame)
+                else:
+                    # 调整尺寸
+                    seg_resized = cv2.resize(seg_frame, (1280, 720))
+                    seg_writer.write(seg_resized)
+                
+            prev_frame = frame_data
+            
         # 写Observer的时间戳日志（与视频帧一一对应）
         if OBSERVER_VEHICLE_NAME in csv_writers:
             utc_now = datetime.datetime.now(datetime.timezone.utc)
@@ -456,6 +765,12 @@ def _observer_encode_loop(dt):
         else:
             # 写入线程落后时重置节拍，避免连续负漂移
             next_t = time.perf_counter()
+    
+    # 清理多模态视频编码器
+    if depth_writer is not None:
+        depth_writer.release()
+    if seg_writer is not None:
+        seg_writer.release()
 
 def start_observer_pipeline():
     """启动Observer的专用采集与编码线程，确保CFR并尽可能贴近"真实相机"体验。"""
@@ -490,6 +805,295 @@ def cleanup_recorders():
     for f in csv_files.values():
         f.close()
     print("All recorders cleaned up.")
+
+# ====== 数据导出功能 ======
+
+def export_to_mot_format(base_output_dir=OUT_DIR, export_dir="mot_export"):
+    """
+    将采集的数据导出为MOT (Multiple Object Tracking) 标准格式
+    
+    MOT格式说明:
+    - det.txt: <frame_id>,<id>,<bb_left>,<bb_top>,<bb_width>,<bb_height>,<conf>,<x>,<y>,<z>
+    - gt.txt: <frame_id>,<id>,<bb_left>,<bb_top>,<bb_width>,<bb_height>,<conf>,<class>,<visibility>
+    - seqinfo.ini: 序列信息文件
+    """
+    print("开始导出MOT格式数据...")
+    export_path = os.path.join(base_output_dir, export_dir)
+    os.makedirs(export_path, exist_ok=True)
+    
+    # 为每个Observer序列创建MOT格式
+    if ENABLE_OBSERVER_CAMERA:
+        observer_dir = os.path.join(base_output_dir, OBSERVER_VEHICLE_NAME)
+        if os.path.exists(observer_dir):
+            _export_observer_to_mot(observer_dir, export_path)
+    
+    # 为每个无人机序列创建MOT格式
+    for vehicle in VEHICLES:
+        vehicle_dir = os.path.join(base_output_dir, vehicle)
+        if os.path.exists(vehicle_dir):
+            _export_vehicle_to_mot(vehicle_dir, export_path, vehicle)
+    
+    print(f"MOT格式数据导出完成，保存至: {export_path}")
+
+def _export_observer_to_mot(observer_dir, export_path, sequence_name="observer_sequence"):
+    """导出Observer数据为MOT格式"""
+    mot_seq_dir = os.path.join(export_path, sequence_name)
+    os.makedirs(mot_seq_dir, exist_ok=True)
+    
+    # 查找最新的CSV日志文件
+    log_dir = os.path.join(observer_dir, "logs")
+    if not os.path.exists(log_dir):
+        return
+    
+    csv_files = [f for f in os.listdir(log_dir) if f.endswith('.csv')]
+    if not csv_files:
+        return
+    
+    latest_csv = sorted(csv_files)[-1]
+    csv_path = os.path.join(log_dir, latest_csv)
+    
+    # 读取CSV数据并生成MOT格式
+    gt_data = []
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        frame_id = 1
+        for row in reader:
+            # 为每个无人机生成边界框数据
+            for i, vehicle in enumerate(VEHICLES, 1):
+                # 查找该无人机的边界框信息
+                bbox_cols = [col for col in row.keys() if col.startswith(f'{vehicle}_bbox_')]
+                if len(bbox_cols) >= 4:
+                    try:
+                        bb_left = float(row.get(f'{vehicle}_bbox_2d_x1', 0))
+                        bb_top = float(row.get(f'{vehicle}_bbox_2d_y1', 0))
+                        bb_right = float(row.get(f'{vehicle}_bbox_2d_x2', 0))
+                        bb_bottom = float(row.get(f'{vehicle}_bbox_2d_y2', 0))
+                        
+                        bb_width = bb_right - bb_left
+                        bb_height = bb_bottom - bb_top
+                        
+                        if bb_width > 0 and bb_height > 0:
+                            # MOT格式: frame,id,bb_left,bb_top,bb_width,bb_height,conf,class,visibility
+                            conf = 1.0  # 假设置信度为1
+                            object_class = 1  # 无人机类别
+                            visibility = 1.0  # 完全可见
+                            
+                            gt_data.append(f"{frame_id},{i},{bb_left:.2f},{bb_top:.2f},{bb_width:.2f},{bb_height:.2f},{conf},{object_class},{visibility}")
+                    except (ValueError, TypeError):
+                        continue
+            frame_id += 1
+    
+    # 写入gt.txt文件
+    gt_file = os.path.join(mot_seq_dir, "gt.txt")
+    with open(gt_file, 'w') as f:
+        f.write('\n'.join(gt_data))
+    
+    # 创建seqinfo.ini文件
+    seqinfo = f"""[Sequence]
+name={sequence_name}
+imDir=img1
+frameRate=30
+seqLength={frame_id-1}
+imWidth=1280
+imHeight=720
+imExt=.jpg
+"""
+    
+    seqinfo_file = os.path.join(mot_seq_dir, "seqinfo.ini")
+    with open(seqinfo_file, 'w') as f:
+        f.write(seqinfo)
+    
+    print(f"MOT序列导出: {sequence_name} ({frame_id-1} 帧)")
+
+def _export_vehicle_to_mot(vehicle_dir, export_path, vehicle_name):
+    """导出单个无人机数据为MOT格式"""
+    # 无人机视角的MOT数据主要用于ego-motion分析
+    mot_seq_dir = os.path.join(export_path, f"{vehicle_name}_ego")
+    os.makedirs(mot_seq_dir, exist_ok=True)
+    
+    # 简化的序列信息，主要记录其他无人机的相对位置
+    seqinfo = f"""[Sequence]
+name={vehicle_name}_ego
+imDir=img1
+frameRate={CAPTURE_FPS}
+seqLength=1000
+imWidth=640
+imHeight=480
+imExt=.jpg
+"""
+    
+    seqinfo_file = os.path.join(mot_seq_dir, "seqinfo.ini")
+    with open(seqinfo_file, 'w') as f:
+        f.write(seqinfo)
+
+def export_to_coco_format(base_output_dir=OUT_DIR, export_dir="coco_export"):
+    """
+    将采集的数据导出为COCO目标检测格式
+    
+    COCO格式包含:
+    - annotations: 边界框和分类信息
+    - images: 图像元数据
+    - categories: 类别定义
+    """
+    print("开始导出COCO格式数据...")
+    export_path = os.path.join(base_output_dir, export_dir)
+    os.makedirs(export_path, exist_ok=True)
+    
+    if ENABLE_OBSERVER_CAMERA:
+        observer_dir = os.path.join(base_output_dir, OBSERVER_VEHICLE_NAME)
+        if os.path.exists(observer_dir):
+            _export_observer_to_coco(observer_dir, export_path)
+    
+    print(f"COCO格式数据导出完成，保存至: {export_path}")
+
+def _export_observer_to_coco(observer_dir, export_path):
+    """导出Observer数据为COCO格式"""
+    # COCO数据结构
+    coco_data = {
+        "info": {
+            "description": "UAV Swarm Tracking Dataset",
+            "url": "https://github.com/airsim/airsim",
+            "version": "1.0",
+            "year": datetime.datetime.now().year,
+            "contributor": "AirSim Multi-Drone Capture System",
+            "date_created": datetime.datetime.now().isoformat()
+        },
+        "licenses": [{
+            "id": 1,
+            "name": "MIT License",
+            "url": "https://opensource.org/licenses/MIT"
+        }],
+        "categories": [{
+            "id": 1,
+            "name": "drone",
+            "supercategory": "vehicle"
+        }],
+        "images": [],
+        "annotations": []
+    }
+    
+    # 查找最新的CSV日志文件
+    log_dir = os.path.join(observer_dir, "logs")
+    if not os.path.exists(log_dir):
+        return
+    
+    csv_files = [f for f in os.listdir(log_dir) if f.endswith('.csv')]
+    if not csv_files:
+        return
+    
+    latest_csv = sorted(csv_files)[-1]
+    csv_path = os.path.join(log_dir, latest_csv)
+    
+    # 处理图像和标注数据
+    image_id = 1
+    annotation_id = 1
+    
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            # 图像信息
+            image_info = {
+                "id": image_id,
+                "width": 1280,
+                "height": 720,
+                "file_name": f"frame_{image_id:06d}.jpg",
+                "license": 1,
+                "date_captured": row.get('timestamp_utc', datetime.datetime.now().isoformat())
+            }
+            coco_data["images"].append(image_info)
+            
+            # 为每个无人机生成标注
+            for vehicle in VEHICLES:
+                bbox_cols = [col for col in row.keys() if col.startswith(f'{vehicle}_bbox_')]
+                if len(bbox_cols) >= 4:
+                    try:
+                        bb_left = float(row.get(f'{vehicle}_bbox_2d_x1', 0))
+                        bb_top = float(row.get(f'{vehicle}_bbox_2d_y1', 0))
+                        bb_right = float(row.get(f'{vehicle}_bbox_2d_x2', 0))
+                        bb_bottom = float(row.get(f'{vehicle}_bbox_2d_y2', 0))
+                        
+                        bb_width = bb_right - bb_left
+                        bb_height = bb_bottom - bb_top
+                        
+                        if bb_width > 0 and bb_height > 0:
+                            annotation = {
+                                "id": annotation_id,
+                                "image_id": image_id,
+                                "category_id": 1,  # 无人机类别
+                                "bbox": [bb_left, bb_top, bb_width, bb_height],
+                                "area": bb_width * bb_height,
+                                "iscrowd": 0
+                            }
+                            
+                            # 添加3D信息（扩展COCO格式）
+                            annotation["bbox_3d"] = {
+                                "center_x": float(row.get(f'{vehicle}_bbox_3d_center_x', 0)),
+                                "center_y": float(row.get(f'{vehicle}_bbox_3d_center_y', 0)),
+                                "center_z": float(row.get(f'{vehicle}_bbox_3d_center_z', 0)),
+                                "size_x": DRONE_BBOX_SIZE[0],
+                                "size_y": DRONE_BBOX_SIZE[1],
+                                "size_z": DRONE_BBOX_SIZE[2]
+                            }
+                            
+                            coco_data["annotations"].append(annotation)
+                            annotation_id += 1
+                    except (ValueError, TypeError):
+                        continue
+            
+            image_id += 1
+    
+    # 保存COCO格式文件
+    coco_file = os.path.join(export_path, "annotations.json")
+    with open(coco_file, 'w', encoding='utf-8') as f:
+        json.dump(coco_data, f, indent=2, ensure_ascii=False)
+    
+    print(f"COCO数据集导出: {len(coco_data['images'])} 张图像, {len(coco_data['annotations'])} 个标注")
+
+def export_dataset_summary(base_output_dir=OUT_DIR):
+    """生成数据集摘要信息"""
+    summary = {
+        "export_time": datetime.datetime.now().isoformat(),
+        "vehicles": VEHICLES,
+        "observer_enabled": ENABLE_OBSERVER_CAMERA,
+        "capture_fps": CAPTURE_FPS,
+        "observer_fps": OBSERVER_FPS if ENABLE_OBSERVER_CAMERA else None,
+        "depth_segmentation_enabled": ENABLE_DEPTH_SEGMENTATION,
+        "drone_depth_segmentation_enabled": ENABLE_DRONE_DEPTH_SEGMENTATION,
+        "flight_altitude": FLIGHT_ALT,
+        "flight_speed": FLIGHT_SPEED,
+        "bbox_size": DRONE_BBOX_SIZE,
+        "sequences": []
+    }
+    
+    # 扫描输出目录收集序列信息
+    for item in os.listdir(base_output_dir):
+        item_path = os.path.join(base_output_dir, item)
+        if os.path.isdir(item_path) and item in VEHICLES + [OBSERVER_VEHICLE_NAME]:
+            video_dir = os.path.join(item_path, "videos")
+            log_dir = os.path.join(item_path, "logs")
+            
+            sequence_info = {
+                "name": item,
+                "type": "observer" if item == OBSERVER_VEHICLE_NAME else "drone",
+                "video_files": [],
+                "log_files": []
+            }
+            
+            if os.path.exists(video_dir):
+                sequence_info["video_files"] = [f for f in os.listdir(video_dir) if f.endswith('.mp4')]
+            
+            if os.path.exists(log_dir):
+                sequence_info["log_files"] = [f for f in os.listdir(log_dir) if f.endswith('.csv')]
+            
+            summary["sequences"].append(sequence_info)
+    
+    # 保存摘要文件
+    summary_file = os.path.join(base_output_dir, "dataset_summary.json")
+    with open(summary_file, 'w', encoding='utf-8') as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    
+    print(f"数据集摘要已保存至: {summary_file}")
+    return summary
 
 def frame_from_response(resp):
     """从 AirSim ImageResponse 中解析为 BGR 图像（numpy 数组）。
@@ -543,8 +1147,13 @@ def follow_paths_and_capture(duration_seconds):
 
     while time.time() - start_time < duration_seconds:
         tick_start = time.time()
-        # 使用未压缩图像以避免每帧 PNG 解码开销
+        # 构建多模态图像采集请求
         requests = [airsim.ImageRequest(CAM_IDX, airsim.ImageType.Scene, pixels_as_float=False, compress=False)]
+        if ENABLE_DRONE_DEPTH_SEGMENTATION:
+            requests.extend([
+                airsim.ImageRequest(CAM_IDX, airsim.ImageType.DepthPerspective, pixels_as_float=True, compress=False),
+                airsim.ImageRequest(CAM_IDX, airsim.ImageType.Segmentation, pixels_as_float=False, compress=False)
+            ])
         future_responses = {}
         for v in VEHICLES:
             sensor_this_frame = (frame_idx % SENSOR_LOG_EVERY_N == 0)
@@ -578,12 +1187,51 @@ def follow_paths_and_capture(duration_seconds):
             ts_utc = utc_now.isoformat()
             ts_ms = int(utc_now.timestamp() * 1000)
 
-            # 保存图像并写入视频
+            # 保存多模态图像数据并写入视频
             if img_resp and img_resp[0]:
+                # RGB图像处理
                 frame = frame_from_response(img_resp[0])
+                depth_frame = None
+                seg_frame = None
+                
+                # 处理深度和分割数据
+                if ENABLE_DRONE_DEPTH_SEGMENTATION and len(img_resp) >= 3:
+                    # 深度图处理
+                    if img_resp[1] and img_resp[1].image_data_float:
+                        depth_data = np.array(img_resp[1].image_data_float, dtype=np.float32)
+                        depth_frame = depth_data.reshape(img_resp[1].height, img_resp[1].width)
+                        # 将深度转换为可视化图像
+                        depth_normalized = np.clip(depth_frame / 100.0, 0, 1)
+                        depth_frame = (depth_normalized * 255).astype(np.uint8)
+                        # 确保深度图像是3通道的（复制灰度通道为RGB）
+                        if len(depth_frame.shape) == 2:
+                            depth_frame = cv2.cvtColor(depth_frame, cv2.COLOR_GRAY2BGR)
+                    
+                    # 分割掩码处理
+                    if img_resp[2]:
+                        seg_frame = frame_from_response(img_resp[2])
+                
+                # 写入RGB视频
                 if frame is not None and v in video_writers:
                     video_writers[v].write(frame)
                     last_frames[v] = frame
+                    
+                # 写入深度和分割视频（如果启用）
+                if ENABLE_DRONE_DEPTH_SEGMENTATION:
+                    if depth_frame is not None and f"{v}_depth" in video_writers:
+                        # 确保尺寸匹配（无人机默认640x480）
+                        if depth_frame.shape[:2] == (480, 640):  # (height, width)
+                            video_writers[f"{v}_depth"].write(depth_frame)
+                        else:
+                            depth_resized = cv2.resize(depth_frame, (640, 480))
+                            video_writers[f"{v}_depth"].write(depth_resized)
+                    if seg_frame is not None and f"{v}_segmentation" in video_writers:
+                        # 确保尺寸匹配
+                        if seg_frame.shape[:2] == (480, 640):  # (height, width)
+                            video_writers[f"{v}_segmentation"].write(seg_frame)
+                        else:
+                            seg_resized = cv2.resize(seg_frame, (640, 480))
+                            video_writers[f"{v}_segmentation"].write(seg_resized)
                     if SAVE_PNG_EVERY_N and (frame_idx % SAVE_PNG_EVERY_N == 0):
                         img_fname = os.path.join(OUT_DIR, v, "images", f"{frame_idx:06d}.png")
                         cv2.imwrite(img_fname, frame)
@@ -593,20 +1241,20 @@ def follow_paths_and_capture(duration_seconds):
                 ts_utc, ts_ms, frame_idx,
                 state.kinematics_estimated.position.x_val, state.kinematics_estimated.position.y_val, state.kinematics_estimated.position.z_val,
                 state.kinematics_estimated.orientation.w_val, state.kinematics_estimated.orientation.x_val, state.kinematics_estimated.orientation.y_val, state.kinematics_estimated.orientation.z_val,
-                (gps.gnss.geo_point.latitude if gps else np.nan),
-                (gps.gnss.geo_point.longitude if gps else np.nan),
-                (gps.gnss.geo_point.altitude if gps else np.nan),
-                (imu.linear_acceleration.x_val if imu else np.nan),
-                (imu.linear_acceleration.y_val if imu else np.nan),
-                (imu.linear_acceleration.z_val if imu else np.nan),
-                (imu.angular_velocity.x_val if imu else np.nan),
-                (imu.angular_velocity.y_val if imu else np.nan),
-                (imu.angular_velocity.z_val if imu else np.nan),
-                (baro.altitude if baro else np.nan),
-                (baro.pressure if baro else np.nan),
-                (mag.magnetic_field_body.x_val if mag else np.nan),
-                (mag.magnetic_field_body.y_val if mag else np.nan),
-                (mag.magnetic_field_body.z_val if mag else np.nan)
+                (gps.gnss.geo_point.latitude if gps else float('nan')),
+                (gps.gnss.geo_point.longitude if gps else float('nan')),
+                (gps.gnss.geo_point.altitude if gps else float('nan')),
+                (imu.linear_acceleration.x_val if imu else float('nan')),
+                (imu.linear_acceleration.y_val if imu else float('nan')),
+                (imu.linear_acceleration.z_val if imu else float('nan')),
+                (imu.angular_velocity.x_val if imu else float('nan')),
+                (imu.angular_velocity.y_val if imu else float('nan')),
+                (imu.angular_velocity.z_val if imu else float('nan')),
+                (baro.altitude if baro else float('nan')),
+                (baro.pressure if baro else float('nan')),
+                (mag.magnetic_field_body.x_val if mag else float('nan')),
+                (mag.magnetic_field_body.y_val if mag else float('nan')),
+                (mag.magnetic_field_body.z_val if mag else float('nan'))
             ]
             if v in csv_writers:
                 csv_writers[v].writerow(row)
@@ -626,22 +1274,174 @@ def follow_paths_and_capture(duration_seconds):
                 ts_utc = utc_now.isoformat()
                 ts_ms = int(utc_now.timestamp() * 1000)
                 csv_writers[OBSERVER_VEHICLE_NAME].writerow([ts_utc, ts_ms, frame_idx])
+                
+        # 计算并记录边界框标注（用于目标检测训练）
+        if ENABLE_OBSERVER_CAMERA and ENABLE_BBOX_ANNOTATION and (frame_idx % BBOX_LOG_EVERY_N == 0):
+            try:
+                # 获取Observer摄像头的位姿信息
+                observer_pose = client.simGetVehiclePose(vehicle_name=OBSERVER_VEHICLE_NAME)
+                observer_camera_info = client.simGetCameraInfo(OBSERVER_CAMERA_NAME, vehicle_name=OBSERVER_VEHICLE_NAME)
+                
+                # 获取图像尺寸（如果有的话）
+                if OBSERVER_VEHICLE_NAME in video_writers:
+                    writer = video_writers[OBSERVER_VEHICLE_NAME]
+                    # 从VideoWriter获取尺寸有点复杂，我们使用配置的尺寸
+                    img_width = 1280  # 从settings.json配置
+                    img_height = 720
+                else:
+                    img_width, img_height = 1280, 720
+                
+                # 获取当前所有无人机的位姿
+                drone_poses = []
+                for v in VEHICLES:
+                    try:
+                        pose = client.simGetVehiclePose(vehicle_name=v)
+                        drone_poses.append((v, pose))
+                    except Exception:
+                        pass
+                
+                # 计算集群动力学特征
+                poses_only = [pose for _, pose in drone_poses]
+                swarm_dynamics = compute_swarm_dynamics(poses_only)
+                
+                # 构建边界框标注行
+                bbox_row = [
+                    datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    int(time.time() * 1000),
+                    frame_idx,
+                    swarm_dynamics.get('center', (0,0,0))[0],
+                    swarm_dynamics.get('center', (0,0,0))[1], 
+                    swarm_dynamics.get('center', (0,0,0))[2],
+                    swarm_dynamics.get('radius', 0),
+                    swarm_dynamics.get('dispersion', 0),
+                    swarm_dynamics.get('density', 0),
+                    swarm_dynamics.get('num_drones', 0),
+                    swarm_dynamics.get('min_distance', 0),
+                    swarm_dynamics.get('max_distance', 0),
+                    swarm_dynamics.get('avg_distance', 0)
+                ]
+                
+                # 为每架无人机计算2D边界框
+                current_fov = obs_fov_deg if obs_fov_deg else OBSERVER_FOV_MAX
+                for v in VEHICLES:
+                    # 查找对应的位姿信息
+                    drone_pose = None
+                    for drone_name, pose in drone_poses:
+                        if drone_name == v:
+                            drone_pose = pose
+                            break
+                    
+                    if drone_pose:
+                        world_pos = (drone_pose.position.x_val, drone_pose.position.y_val, drone_pose.position.z_val)
+                        bbox_2d, visibility, distance = project_3d_to_2d_bbox(
+                            world_pos, DRONE_BBOX_SIZE, observer_pose, current_fov, img_width, img_height
+                        )
+                        
+                        if bbox_2d:
+                            bbox_row.extend([
+                                bbox_2d[0], bbox_2d[1], bbox_2d[2], bbox_2d[3],  # x_min, y_min, x_max, y_max
+                                visibility, distance,
+                                world_pos[0], world_pos[1], world_pos[2]  # 世界坐标
+                            ])
+                        else:
+                            # 无人机不在视野内
+                            bbox_row.extend([-1, -1, -1, -1, 0.0, distance, world_pos[0], world_pos[1], world_pos[2]])
+                    else:
+                        # 无法获取位姿信息
+                        bbox_row.extend([-1, -1, -1, -1, 0.0, 0.0, 0.0, 0.0, 0.0])
+                
+                # 写入边界框标注CSV
+                bbox_writer_key = f"{OBSERVER_VEHICLE_NAME}_bbox"
+                if bbox_writer_key in csv_writers:
+                    csv_writers[bbox_writer_key].writerow(bbox_row)
+                    
+            except Exception as e:
+                print(f"Bbox annotation error at frame {frame_idx}: {e}")
 
         # 动态计算目标点，实现复杂运动
         for v in VEHICLES:
             # 每帧都更新目标点，实现平滑运动
-            idx = (frame_idx + hash(v)) % len(PATHS[v])
+            idx = (frame_idx + abs(hash(v))) % len(PATHS[v])
             next_pos = PATHS[v][idx]
-            # --- 插入简单动作 ---
-            # 例如：每隔30帧悬停1秒、每隔50帧旋转、每隔40帧抖动
-            if frame_idx % 30 == 0 and v == "Drone1":
-                # 非阻塞悬停：不再 sleep，避免心跳中断
-                client.hoverAsync(vehicle_name=v)
-            elif frame_idx % 50 == 0 and v == "Drone2":
-                client.rotateByYawRateAsync(60, 1, vehicle_name=v)  # 非阻塞
-            elif frame_idx % 40 == 0 and v == "Drone1":
-                client.moveByVelocityAsync(1, 0, 0, 0.3, vehicle_name=v)  # 非阻塞
+            
+            # === 拦截场景特化的机动动作 ===
+            elapsed_time = time.time() - start_time
+            
+            # Drone1: 规避机动 - 随机急转弯和突然加减速
+            if v == "Drone1":
+                if frame_idx % 45 == 0:  # 每2.25秒一次急转弯
+                    # 随机急转弯
+                    turn_angle = float(np.random.uniform(-90, 90))  # 大角度转弯
+                    client.rotateByYawRateAsync(turn_angle * 2, 1.0, vehicle_name=v)
+                elif frame_idx % 60 == 30:  # 突然加速
+                    accel_vel = float(np.random.uniform(8, 15))  # 高速机动
+                    rand_direction = float(np.random.uniform(0, 2*math.pi))
+                    vx = accel_vel * math.cos(rand_direction)
+                    vy = accel_vel * math.sin(rand_direction)
+                    client.moveByVelocityAsync(vx, vy, 0, 1.5, vehicle_name=v)
+                else:
+                    # 正常轨迹跟随但速度更高
+                    client.moveToPositionAsync(next_pos[0], next_pos[1], next_pos[2], FLIGHT_SPEED * 1.8, vehicle_name=v)
+            
+            # Drone2: 拦截者 - 高速直线冲刺和悬停
+            elif v == "Drone2":
+                if frame_idx % 100 == 0:  # 每5秒一次拦截冲刺
+                    # 计算目标方向(朝向集群中心)
+                    center, _ = compute_swarm_center_and_radius([client.simGetVehiclePose(vehicle_name=vv) for vv in VEHICLES if vv != v])
+                    current_pos = client.simGetVehiclePose(vehicle_name=v).position
+                    dx = center[0] - current_pos.x_val
+                    dy = center[1] - current_pos.y_val
+                    norm = math.sqrt(dx**2 + dy**2)
+                    if norm > 0:
+                        intercept_speed = 20.0  # 拦截速度
+                        vx = intercept_speed * dx / norm
+                        vy = intercept_speed * dy / norm
+                        client.moveByVelocityAsync(vx, vy, -2, 3.0, vehicle_name=v)  # 3秒冲刺
+                elif frame_idx % 100 == 80:  # 冲刺后短暂悬停
+                    client.hoverAsync(vehicle_name=v)
+                else:
+                    client.moveToPositionAsync(next_pos[0], next_pos[1], next_pos[2], FLIGHT_SPEED * 1.5, vehicle_name=v)
+            
+            # Drone3: 战斗机动 - 垂直机动和滚转
+            elif v == "Drone3":
+                if frame_idx % 80 == 0:  # 垂直机动
+                    climb_speed = float(np.random.choice([-8, 8]))  # 快速爬升或俯冲
+                    client.moveByVelocityAsync(0, 0, climb_speed, 1.0, vehicle_name=v)
+                elif frame_idx % 40 == 20:  # 高速转弯
+                    yaw_rate = float(np.random.uniform(-180, 180))  # 高角速度转弯
+                    client.rotateByYawRateAsync(yaw_rate, 0.8, vehicle_name=v)
+                else:
+                    client.moveToPositionAsync(next_pos[0], next_pos[1], next_pos[2], FLIGHT_SPEED * 1.3, vehicle_name=v)
+            
+            # Drone4: 编队机动 - 协同和分离
+            elif v == "Drone4":
+                if frame_idx % 120 == 0:  # 编队分离
+                    # 远离其他无人机
+                    separation_force = (0, 0, 0)
+                    try:
+                        current_pos = client.simGetVehiclePose(vehicle_name=v).position
+                        for other_v in VEHICLES:
+                            if other_v != v:
+                                other_pos = client.simGetVehiclePose(vehicle_name=other_v).position
+                                dx = current_pos.x_val - other_pos.x_val
+                                dy = current_pos.y_val - other_pos.y_val
+                                dist = math.sqrt(dx**2 + dy**2)
+                                if dist > 0:
+                                    # 排斥力
+                                    separation_force = (
+                                        separation_force[0] + dx/dist * 5,
+                                        separation_force[1] + dy/dist * 5,
+                                        separation_force[2]
+                                    )
+                        if abs(separation_force[0]) > 0 or abs(separation_force[1]) > 0:
+                            client.moveByVelocityAsync(separation_force[0], separation_force[1], 0, 2.0, vehicle_name=v)
+                    except Exception:
+                        pass
+                else:
+                    client.moveToPositionAsync(next_pos[0], next_pos[1], next_pos[2], FLIGHT_SPEED, vehicle_name=v)
+            
             else:
+                # 默认行为
                 client.moveToPositionAsync(next_pos[0], next_pos[1], next_pos[2], FLIGHT_SPEED, vehicle_name=v)
 
         # 每隔若干帧更新一次观察者摄像机位置，以降低开销
@@ -687,7 +1487,23 @@ def landing_and_cleanup():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Multi-drone data capture script for AirSim.")
     parser.add_argument('--duration', type=int, default=60, help='Duration of the capture in seconds.')
+    parser.add_argument('--export-mot', action='store_true', help='Export captured data to MOT format after recording.')
+    parser.add_argument('--export-coco', action='store_true', help='Export captured data to COCO format after recording.')
+    parser.add_argument('--export-summary', action='store_true', help='Generate dataset summary after recording.')
+    parser.add_argument('--export-only', action='store_true', help='Skip recording, only export existing data.')
     args = parser.parse_args()
+
+    # 如果只导出数据，跳过录制过程
+    if args.export_only:
+        print("仅导出现有数据...")
+        if args.export_mot:
+            export_to_mot_format()
+        if args.export_coco:
+            export_to_coco_format()
+        if args.export_summary:
+            export_dataset_summary()
+        print("数据导出完成。")
+        exit(0)
 
     try:
         initialize_client()
@@ -721,4 +1537,19 @@ if __name__ == "__main__":
         if client:
             landing_and_cleanup()
         cleanup_recorders()
-        print("Done.")
+        print("录制完成。")
+        
+        # 执行数据导出（如果指定了相应参数）
+        if args.export_mot:
+            print("开始导出MOT格式数据...")
+            export_to_mot_format()
+        
+        if args.export_coco:
+            print("开始导出COCO格式数据...")
+            export_to_coco_format()
+        
+        if args.export_summary:
+            print("生成数据集摘要...")
+            export_dataset_summary()
+        
+        print("所有任务完成。")
