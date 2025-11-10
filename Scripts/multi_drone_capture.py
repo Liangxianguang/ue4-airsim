@@ -21,9 +21,9 @@ FLIGHT_ALT = -10.0  # 飞得更高以获得更广的视野
 ENABLE_OBSERVER_CAMERA = True
 OBSERVER_CAMERA_NAME = "0"          # 外部摄像机的相机索引名，通常为字符串"0"
 OBSERVER_VEHICLE_NAME = "Observer"  # 外部摄像机在 settings.json 中的名称
-OBSERVER_COMPRESS = True             # 为Observer使用压缩图，降低高分辨率下的带宽与拷贝开销
+OBSERVER_COMPRESS = False            # 改为False，提高图像质量和处理速度
 OBSERVER_DEDICATED_THREAD = True     # 为Observer启用专用采集+编码线程，获得更稳定的“相机式”录制
-OBSERVER_FPS = 60                    # Observer 专用恒定输出帧率（建议高于/等于 CAPTURE_FPS）
+OBSERVER_FPS = 60                   
 ENABLE_DEPTH_SEGMENTATION = False    # 启用深度图和分割掩码采集（仅对Observer有效）
 ENABLE_DRONE_DEPTH_SEGMENTATION = False  # 启用无人机深度图和分割掩码采集（会显著增加数据量）
 
@@ -31,27 +31,27 @@ ENABLE_DRONE_DEPTH_SEGMENTATION = False  # 启用无人机深度图和分割掩�
 # lock: 固定距离与高度
 # bounded: 自适应但限制在最小/最大范围并做EMA平滑
 # auto: 原始逻辑，完全自适应
-OBSERVER_ZOOM_MODE = "bounded"      # 可选 "lock" | "bounded" | "auto"
-OBSERVER_FIXED_DIST = 30.0           # ZOOM_MODE=lock 时水平距离
-OBSERVER_FIXED_HEIGHT = 25.0         # ZOOM_MODE=lock 时高度（正值，内部转换为AirSim坐标系）
+OBSERVER_ZOOM_MODE = "lock"          # 改为lock模式，固定距离
+OBSERVER_FIXED_DIST = 35.0           # 固定水平距离
+OBSERVER_FIXED_HEIGHT = 20.0         # 固定高度
 OBSERVER_MIN_DIST = 22.0             # bounded 模式距离/高度范围
 OBSERVER_MAX_DIST = 45.0
 OBSERVER_MIN_HEIGHT = 18.0
 OBSERVER_MAX_HEIGHT = 35.0
-OBSERVER_ZOOM_SMOOTH = 0.4          # EMA 平滑系数 0-1
-OBSERVER_PHASE_SWITCH_SEC = 5.0     # 前N秒近景lock，之后切换到bounded全景
+OBSERVER_ZOOM_SMOOTH = 0.2          # 从0.4改为0.2，减少缩放变化
+OBSERVER_PHASE_SWITCH_SEC = 10.0     # 延长近景锁定时间
 
 # Observer 摄像机平滑与限制（cinematic）
 # 每 N 帧更新一次观察者摄像机（降低开销），值越小更新越频繁
-OBSERVER_UPDATE_EVERY_N = 2
+OBSERVER_UPDATE_EVERY_N = 5           # 从2改为5，减少更新频率
 # 平滑时间常数（秒）：小值更紧贴目标，大值更平滑
-CAM_SMOOTH_POS_TAU = 0.4
-CAM_SMOOTH_ROT_TAU = 0.18
+CAM_SMOOTH_POS_TAU = 1.2              # 从0.4改为1.2，增加位置平滑
+CAM_SMOOTH_ROT_TAU = 0.8              # 从0.18改为0.8，增加旋转平滑
 # 最大位置速度（单位：世界坐标/秒）与最大角速度（度/秒）
-CAM_MAX_POS_SPEED = 30.0
-CAM_MAX_ANG_SPEED_DEG = 120.0
+CAM_MAX_POS_SPEED = 10.0              # 从30改为10，降低移动速度
+CAM_MAX_ANG_SPEED_DEG = 30.0          # 从120改为30，降低旋转速度
 # 可选的FOV平滑（启用可随缩放改变视场）
-OBSERVER_FOV_ENABLE = True
+OBSERVER_FOV_ENABLE = False           # 禁用FOV变化，减少视觉跳动
 OBSERVER_FOV_MIN = 30.0
 OBSERVER_FOV_MAX = 75.0
 OBSERVER_FOV_SMOOTH = 0.12
@@ -308,11 +308,13 @@ def _exp_lerp(prev, target, dt, tau):
     alpha = 1.0 - math.exp(-dt / tau)
     return prev + alpha * (target - prev)
 
-# 将观察者摄像机移动到能覆盖集群的位置，并指向质心
-def update_observer_camera(client, vehicles, strength=2.0):
+# 将观察者摄像机移动到能覆盖集群的位置，并指向质心 - 简化稳定版本
+def update_observer_camera_stable(client, vehicles, strength=2.0):
+    """简化版Observer相机控制，减少晃动和距离变化"""
     try:
         if not ENABLE_OBSERVER_CAMERA:
             return
+        
         # 获取所有无人机的位姿
         poses = []
         for v in vehicles:
@@ -320,131 +322,83 @@ def update_observer_camera(client, vehicles, strength=2.0):
                 poses.append(client.simGetVehiclePose(vehicle_name=v))
             except Exception:
                 pass
+        
+        if not poses:
+            return
+            
         center, radius = compute_swarm_center_and_radius(poses)
         cx, cy, cz = center
 
-        # 全局状态（zoom EMA 与 cinematic）
-        global observer_dist_ema, observer_hgt_ema, observer_phase_start
-        global swarm_center_ema, swarm_radius_ema
-        global obs_cam_pos, obs_cam_yaw, obs_cam_pitch, obs_last_t, obs_fov_deg
+        # 全局状态
+        global obs_cam_pos, obs_cam_yaw, obs_cam_pitch, obs_last_t
+        global swarm_center_ema
 
         now = time.perf_counter()
-        # 初始时间
-        if observer_phase_start is None:
-            observer_phase_start = now
-
-        # 平滑质心与半径（避免快速跳动导致相机抖动）
+        dt = (now - obs_last_t) if obs_last_t else (1.0 / max(OBSERVER_FPS, 30))
+        
+        # 平滑质心（减少抖动）
         if swarm_center_ema is None:
             swarm_center_ema = (cx, cy, cz)
         else:
-            dt_tmp = max(1e-6, (now - obs_last_t) if obs_last_t else (1.0 / max(OBSERVER_FPS, 30)))
+            # 更强的平滑
+            tau = CAM_SMOOTH_POS_TAU * 3  # 三倍平滑
             swarm_center_ema = (
-                _exp_lerp(swarm_center_ema[0], cx, dt_tmp, CAM_SMOOTH_POS_TAU),
-                _exp_lerp(swarm_center_ema[1], cy, dt_tmp, CAM_SMOOTH_POS_TAU),
-                _exp_lerp(swarm_center_ema[2], cz, dt_tmp, CAM_SMOOTH_POS_TAU)
+                _exp_lerp(swarm_center_ema[0], cx, dt, tau),
+                _exp_lerp(swarm_center_ema[1], cy, dt, tau),
+                _exp_lerp(swarm_center_ema[2], cz, dt, tau)
             )
-        swarm_radius_ema = _exp_lerp(swarm_radius_ema, radius, (now - obs_last_t) if obs_last_t else (1.0 / max(OBSERVER_FPS, 30)), CAM_SMOOTH_POS_TAU)
 
-        # 根据缩放模式确定距离/高度（使用原有EMA以控制zoom响应）
-        effective_mode = OBSERVER_ZOOM_MODE
-        if OBSERVER_ZOOM_MODE == "bounded" and (now - observer_phase_start) < OBSERVER_PHASE_SWITCH_SEC:
-            effective_mode = "lock"
+        # 固定距离和高度（lock模式）
+        horiz_dist = float(OBSERVER_FIXED_DIST)
+        height = float(OBSERVER_FIXED_HEIGHT)
+        
+        # 目标位置（固定偏移）
+        target_pos = (
+            swarm_center_ema[0] - horiz_dist, 
+            swarm_center_ema[1], 
+            swarm_center_ema[2] - height
+        )
 
-        if effective_mode == "lock":
-            horiz_dist = float(OBSERVER_FIXED_DIST)
-            height = float(OBSERVER_FIXED_HEIGHT)
-        else:
-            raw_dist = max(25.0, swarm_radius_ema * strength)
-            raw_hgt = max(20.0, swarm_radius_ema * 1.2)
-            if effective_mode == "bounded":
-                raw_dist = float(np.clip(raw_dist, OBSERVER_MIN_DIST, OBSERVER_MAX_DIST))
-                raw_hgt = float(np.clip(raw_hgt, OBSERVER_MIN_HEIGHT, OBSERVER_MAX_HEIGHT))
-            if observer_dist_ema is None:
-                observer_dist_ema, observer_hgt_ema = raw_dist, raw_hgt
-            else:
-                a = float(np.clip(OBSERVER_ZOOM_SMOOTH, 0.0, 1.0))
-                observer_dist_ema = (1 - a) * observer_dist_ema + a * raw_dist
-                observer_hgt_ema = (1 - a) * observer_hgt_ema + a * raw_hgt
-            horiz_dist = observer_dist_ema
-            height = observer_hgt_ema
-
-        # 目标位置（以质心为基准向 -X 偏移）
-        target_pos = (swarm_center_ema[0] - horiz_dist, swarm_center_ema[1], swarm_center_ema[2] - height)
-
-        # 目标朝向（指向质心）
+        # 目标朝向（指向集群中心）
         dir_x = swarm_center_ema[0] - target_pos[0]
         dir_y = swarm_center_ema[1] - target_pos[1]
         dir_z = swarm_center_ema[2] - target_pos[2]
         target_yaw = math.atan2(dir_y, dir_x)
         target_pitch = -math.atan2(dir_z, math.hypot(dir_x, dir_y))
-        roll = 0.0
 
-        # 估计 dt
-        dt = (now - obs_last_t) if obs_last_t else (1.0 / max(OBSERVER_FPS, 30))
-
-        # 初始化观察者状态（首次直接跳到目标）
+        # 初始化位置（首次设置）
         if obs_cam_pos is None:
             obs_cam_pos = target_pos
-        else:
-            # 先做指数低通，再限制最大速度
-            new_x = _exp_lerp(obs_cam_pos[0], target_pos[0], dt, CAM_SMOOTH_POS_TAU)
-            new_y = _exp_lerp(obs_cam_pos[1], target_pos[1], dt, CAM_SMOOTH_POS_TAU)
-            new_z = _exp_lerp(obs_cam_pos[2], target_pos[2], dt, CAM_SMOOTH_POS_TAU)
-            # 限速
-            dx = new_x - obs_cam_pos[0]
-            dy = new_y - obs_cam_pos[1]
-            dz = new_z - obs_cam_pos[2]
-            move_len = math.hypot(math.hypot(dx, dy), dz)
-            max_move = CAM_MAX_POS_SPEED * dt
-            if move_len > max_move and move_len > 1e-6:
-                scale = max_move / move_len
-                new_x = obs_cam_pos[0] + dx * scale
-                new_y = obs_cam_pos[1] + dy * scale
-                new_z = obs_cam_pos[2] + dz * scale
-            obs_cam_pos = (new_x, new_y, new_z)
-
-        # 角度限速（按最短方向）
-        if obs_cam_yaw is None:
             obs_cam_yaw = target_yaw
-        else:
-            diff = _wrap_pi(target_yaw - obs_cam_yaw)
-            max_ang = math.radians(CAM_MAX_ANG_SPEED_DEG) * dt
-            step = math.copysign(min(abs(diff), max_ang), diff)
-            obs_cam_yaw = _wrap_pi(obs_cam_yaw + step)
-
-        if obs_cam_pitch is None:
             obs_cam_pitch = target_pitch
         else:
-            pdiff = _wrap_pi(target_pitch - obs_cam_pitch)
-            pmax = math.radians(CAM_MAX_ANG_SPEED_DEG) * dt
-            pstep = math.copysign(min(abs(pdiff), pmax), pdiff)
-            obs_cam_pitch = _wrap_pi(obs_cam_pitch + pstep)
-
-        # FOV 平滑（可选）
-        if OBSERVER_FOV_ENABLE:
-            # 根据 horiz_dist 映射到 FOV 范围
-            t = float(np.clip((horiz_dist - OBSERVER_MIN_DIST) / max(1e-6, (OBSERVER_MAX_DIST - OBSERVER_MIN_DIST)), 0.0, 1.0))
-            target_fov = OBSERVER_FOV_MIN + t * (OBSERVER_FOV_MAX - OBSERVER_FOV_MIN)
-            if obs_fov_deg is None:
-                obs_fov_deg = target_fov
-            else:
-                obs_fov_deg = _exp_lerp(obs_fov_deg, target_fov, dt, OBSERVER_FOV_SMOOTH)
-            try:
-                client.simSetCameraFov(OBSERVER_CAMERA_NAME, float(obs_fov_deg), vehicle_name=OBSERVER_VEHICLE_NAME)
-            except Exception:
-                pass
+            # 平滑移动到目标位置（更强的平滑）
+            pos_tau = CAM_SMOOTH_POS_TAU * 4  # 四倍平滑
+            rot_tau = CAM_SMOOTH_ROT_TAU * 4  # 四倍平滑
+            
+            obs_cam_pos = (
+                _exp_lerp(obs_cam_pos[0], target_pos[0], dt, pos_tau),
+                _exp_lerp(obs_cam_pos[1], target_pos[1], dt, pos_tau),
+                _exp_lerp(obs_cam_pos[2], target_pos[2], dt, pos_tau)
+            )
+            
+            # 平滑旋转
+            obs_cam_yaw = _exp_lerp(obs_cam_yaw, target_yaw, dt, rot_tau)
+            obs_cam_pitch = _exp_lerp(obs_cam_pitch, target_pitch, dt, rot_tau)
 
         # 应用相机姿态
         pose = airsim.Pose(
             airsim.Vector3r(obs_cam_pos[0], obs_cam_pos[1], obs_cam_pos[2]),
-            airsim.to_quaternion(obs_cam_pitch, roll, obs_cam_yaw)
+            airsim.to_quaternion(obs_cam_pitch, 0.0, obs_cam_yaw)
         )
+        
         try:
             client.simSetCameraPose(OBSERVER_CAMERA_NAME, pose, vehicle_name=OBSERVER_VEHICLE_NAME)
         except Exception:
             pass
 
         obs_last_t = now
+        
     except Exception:
         # 忽略任何单次更新异常，保持主流程稳定
         pass
@@ -1446,7 +1400,7 @@ def follow_paths_and_capture(duration_seconds):
 
         # 每隔若干帧更新一次观察者摄像机位置，以降低开销
         if ENABLE_OBSERVER_CAMERA and (frame_idx % OBSERVER_UPDATE_EVERY_N == 0):
-            update_observer_camera(client, VEHICLES, strength=2.2)
+            update_observer_camera_stable(client, VEHICLES, strength=2.2)
 
         # 如实际循环间隔大于目标dt，则按比例补写上一帧，尽量与真实时间一致
         if MATCH_REALTIME_OUTPUT:
