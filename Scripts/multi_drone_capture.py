@@ -57,15 +57,15 @@ OBSERVER_FOV_MAX = 75.0
 OBSERVER_FOV_SMOOTH = 0.12
 
 # 当循环性能不足导致实际帧率低于CAPTURE_FPS时，是否通过重复写入上一帧来拉齐视频播放时长
-MATCH_REALTIME_OUTPUT = True
+MATCH_REALTIME_OUTPUT = False  # 关闭补帧,只记录真实捕获的帧,避免视频"加速"效果
 # 为防止极端卡顿导致一次性重复过多帧，设置每tick最大补帧数上限
-MAX_DUP_FRAMES_PER_TICK = 5
+MAX_DUP_FRAMES_PER_TICK = 50  # 提高到50以应对慢速循环(1.3s/次需要补~27帧)
 
 # 性能优化选项
 # 0 表示不单独落盘 PNG（仅写视频）；>0 表示每 N 帧落一张 PNG
 SAVE_PNG_EVERY_N = 0
 # 传感器（IMU/GPS/磁力计/气压计）记录的降采样因子（每 N 帧记录一次）
-SENSOR_LOG_EVERY_N = 5
+SENSOR_LOG_EVERY_N = 1
 # 是否保存 Observer 的视频
 SAVE_OBSERVER_VIDEO = True
 
@@ -151,77 +151,86 @@ def generate_path(pattern, center, radius, alt, num_points=40):
             path.append((float(center[0] + i), float(center[1]), float(alt)))
     return path
 
-# 3D坐标转换为Observer相机的2D边界框
-def project_3d_to_2d_bbox(world_pos, world_size, observer_pose, camera_fov, img_width, img_height):
+def quaternion_to_rotation_matrix(q):
+    """将四元数(airsim.Quaternionr)转换为旋转矩阵 R (3x3)."""
+    w = q.w_val; x = q.x_val; y = q.y_val; z = q.z_val
+    # 归一化（防止累计误差）
+    norm = math.sqrt(w*w + x*x + y*y + z*z)
+    if norm == 0:
+        return np.eye(3)
+    w /= norm; x /= norm; y /= norm; z /= norm
+    return np.array([
+        [1 - 2*(y*y + z*z),     2*(x*y - w*z),       2*(x*z + w*y)],
+        [2*(x*y + w*z),         1 - 2*(x*x + z*z),   2*(y*z - w*x)],
+        [2*(x*z - w*y),         2*(y*z + w*x),       1 - 2*(x*x + y*y)]
+    ], dtype=np.float32)
+
+# 3D坐标转换为Observer相机的2D边界框（改进版：使用真实相机位姿与姿态旋转到相机坐标系）
+def project_3d_to_2d_bbox(world_pos, world_size, camera_pose, camera_fov_deg, img_width, img_height):
     """
-    将3D世界坐标中的无人机投影到Observer摄像头的2D图像坐标系
-    
-    Args:
-        world_pos: 无人机在世界坐标系中的位置 (x, y, z)
-        world_size: 无人机在世界坐标系中的尺寸 (width, height, depth)
-        observer_pose: Observer摄像头的位姿信息
-        camera_fov: 相机FOV角度（度）
-        img_width, img_height: 图像尺寸
-        
-    Returns:
-        bbox_2d: (x_min, y_min, x_max, y_max) 或 None（如果不在视野内）
-        visibility: 可见性评分 0.0-1.0
-        distance: 距离观察者的距离
+    改进投影：使用 camera_pose (airsim.Pose) 中的 position 与 orientation。
+    在相机坐标系下假定前向为 +X，右为 +Y，向下为 +Z（AirSim / Unreal NED）。
+    步骤：
+      1. 计算相对向量 rel = P_world - P_cam
+      2. 通过 R_cam^T * rel 得到相机坐标 p_cam
+      3. 若 p_cam.x <= 0 视为在相机后方
+      4. 使用水平 FOV 计算焦距 fx = W / (2*tan(FOV/2))，假定 fy = fx
+      5. 像素投影：u = fx * (p_cam.y / p_cam.x) + cx, v = fx * (-p_cam.z / p_cam.x) + cy
+      6. 利用物理尺寸近似像素尺寸：size_x_px = fx * world_size[0] / p_cam.x (同理 size_y_px)
+    返回：bbox 或 None, visibility(0-1), distance
     """
     try:
-        # 相机位置和朝向
-        cam_pos = observer_pose.position
-        cam_orientation = observer_pose.orientation
-        
-        # 计算无人机相对于相机的位置向量
-        rel_pos = (
+        cam_pos = camera_pose.position
+        cam_quat = camera_pose.orientation
+        rel = np.array([
             world_pos[0] - cam_pos.x_val,
-            world_pos[1] - cam_pos.y_val, 
+            world_pos[1] - cam_pos.y_val,
             world_pos[2] - cam_pos.z_val
-        )
-        
-        # 转换到相机坐标系（简化处理，假设相机朝向+X）
-        # 在实际应用中需要考虑四元数旋转
-        distance = float(math.sqrt(rel_pos[0]**2 + rel_pos[1]**2 + rel_pos[2]**2))
-        
-        if distance < 1.0:  # 太近时跳过
+        ], dtype=np.float32)
+
+        distance = float(np.linalg.norm(rel))
+        if distance < 0.5:  # 太近不稳定
             return None, 0.0, distance
-            
-        # 计算水平和垂直视角
-        fov_rad = math.radians(camera_fov)
-        focal_length = img_width / (2 * math.tan(fov_rad / 2))
-        
-        # 投影到2D（简化投影模型）
-        if rel_pos[0] <= 0:  # 在相机后方
+
+        R_cam = quaternion_to_rotation_matrix(cam_quat)
+        # 世界 -> 相机坐标（相机朝向 +X）
+        p_cam = R_cam.T.dot(rel)
+
+        forward_x = p_cam[0]
+        if forward_x <= 0.01:  # 在后方或几乎共面
             return None, 0.0, distance
-            
-        # 2D投影坐标
-        proj_x = focal_length * rel_pos[1] / rel_pos[0] + img_width / 2
-        proj_y = focal_length * (-rel_pos[2]) / rel_pos[0] + img_height / 2
-        
-        # 根据距离和无人机尺寸计算边界框
-        apparent_size_x = focal_length * world_size[0] / rel_pos[0]
-        apparent_size_y = focal_length * world_size[1] / rel_pos[0]
-        
-        # 边界框坐标
-        x_min = float(max(0, proj_x - apparent_size_x / 2))
-        y_min = float(max(0, proj_y - apparent_size_y / 2))
-        x_max = float(min(img_width - 1, proj_x + apparent_size_x / 2))
-        y_max = float(min(img_height - 1, proj_y + apparent_size_y / 2))
-        
-        # 检查是否在图像范围内
+
+        fov_rad = math.radians(camera_fov_deg)
+        fx = img_width / (2.0 * math.tan(fov_rad / 2.0))
+        fy = fx  # 近似方形像素
+        cx = img_width / 2.0
+        cy = img_height / 2.0
+
+        u = fx * (p_cam[1] / forward_x) + cx
+        v = fy * (-p_cam[2] / forward_x) + cy  # NED z向下：像素 y 方向取负
+
+        # 近似尺寸（使用长宽，忽略高度）
+        size_x_px = fx * world_size[0] / forward_x
+        size_y_px = fy * world_size[1] / forward_x
+        if size_x_px <= 1 or size_y_px <= 1:
+            return None, 0.0, distance  # 太小视为不可用
+
+        x_min = max(0.0, u - size_x_px/2.0)
+        y_min = max(0.0, v - size_y_px/2.0)
+        x_max = min(img_width - 1.0, u + size_x_px/2.0)
+        y_max = min(img_height - 1.0, v + size_y_px/2.0)
+
         if x_max <= x_min or y_max <= y_min:
-            return None, 0.0, float(distance)
-            
-        # 可见性评分（基于边界框在图像中的比例和距离）
+            return None, 0.0, distance
+
+        # 可见性：面积+距离双因子 （面积>图像1%记满 ； 距离<100米满）
         bbox_area = (x_max - x_min) * (y_max - y_min)
         img_area = img_width * img_height
-        area_ratio = min(1.0, bbox_area / (img_area * 0.01))  # 最小1%面积才算可见
-        distance_factor = min(1.0, 100.0 / distance)  # 距离因子
+        area_ratio = min(1.0, bbox_area / (img_area * 0.01))
+        distance_factor = min(1.0, 120.0 / distance)
         visibility = float(area_ratio * distance_factor)
-        
-        return (int(x_min), int(y_min), int(x_max), int(y_max)), visibility, float(distance)
-        
+
+        return (int(round(x_min)), int(round(y_min)), int(round(x_max)), int(round(y_max))), visibility, distance
     except Exception as e:
         print(f"Projection error: {e}")
         return None, 0.0, 0.0
@@ -418,7 +427,7 @@ video_writers = {}
 csv_files = {}
 csv_writers = {}
 CSV_HEADERS = [
-    "timestamp_utc", "timestamp_ms", "frame_idx",
+    "timestamp_utc", "timestamp_ms", "timestamp_us", "frame_idx",
     "pos_x", "pos_y", "pos_z", "quat_w", "quat_x", "quat_y", "quat_z",
     "gps_lat", "gps_lon", "gps_alt",
     "imu_lin_acc_x", "imu_lin_acc_y", "imu_lin_acc_z",
@@ -429,7 +438,7 @@ CSV_HEADERS = [
 
 # Observer视角的边界框标注CSV头部
 OBSERVER_BBOX_HEADERS = [
-    "timestamp_utc", "timestamp_ms", "frame_idx",
+    "timestamp_utc", "timestamp_ms", "timestamp_us", "frame_idx",
     "swarm_center_x", "swarm_center_y", "swarm_center_z",
     "swarm_radius", "swarm_dispersion", "swarm_density", "swarm_num_drones",
     "swarm_min_distance", "swarm_max_distance", "swarm_avg_distance"
@@ -555,7 +564,7 @@ def initialize_recorders(img_size=(640, 480), observer_img_size=None):
         csv_path = os.path.join(OUT_DIR, OBSERVER_VEHICLE_NAME, "logs", f"{OBSERVER_VEHICLE_NAME}_{ts}.csv")
         csv_files[OBSERVER_VEHICLE_NAME] = open(csv_path, 'w', newline='', encoding='utf-8')
         csv_writers[OBSERVER_VEHICLE_NAME] = csv.writer(csv_files[OBSERVER_VEHICLE_NAME])
-        csv_writers[OBSERVER_VEHICLE_NAME].writerow(["timestamp_utc", "timestamp_ms", "frame_idx"]) 
+        csv_writers[OBSERVER_VEHICLE_NAME].writerow(["timestamp_utc", "timestamp_ms", "timestamp_us", "frame_idx"]) 
         print(f"[{OBSERVER_VEHICLE_NAME}] CSV logger initialized at {csv_path}")
         
         # 边界框标注日志（用于目标检测训练）
@@ -644,6 +653,12 @@ def _observer_encode_loop(dt):
     frame_idx = 0
     prev_frame = None
     next_t = time.perf_counter()
+    # 在编码线程内也创建一个本地客户端，用于逐帧计算 bbox（确保每一帧都有详细标注）
+    try:
+        enc_client = airsim.MultirotorClient()
+        enc_client.confirmConnection()
+    except Exception:
+        enc_client = None
     
     # 为多模态数据创建额外的视频编码器
     depth_writer = None
@@ -703,12 +718,97 @@ def _observer_encode_loop(dt):
                 
             prev_frame = frame_data
             
-        # 写Observer的时间戳日志（与视频帧一一对应）
+        # 写Observer的时间戳日志（与视频帧一一对应），并在同一时间戳下写入bbox
         if OBSERVER_VEHICLE_NAME in csv_writers:
             utc_now = datetime.datetime.now(datetime.timezone.utc)
             ts_utc = utc_now.isoformat()
-            ts_ms = int(utc_now.timestamp() * 1000)
-            csv_writers[OBSERVER_VEHICLE_NAME].writerow([ts_utc, ts_ms, frame_idx])
+            epoch_ns = time.time_ns()
+            ts_ms = int(epoch_ns // 1_000_000)
+            ts_us = int(epoch_ns // 1_000)
+            csv_writers[OBSERVER_VEHICLE_NAME].writerow([ts_utc, ts_ms, ts_us, frame_idx])
+            if OBSERVER_VEHICLE_NAME in csv_files and frame_idx % 60 == 0:
+                try:
+                    csv_files[OBSERVER_VEHICLE_NAME].flush()
+                except Exception:
+                    pass
+
+            # 每帧写入 bbox（若启用），保证“真实每帧详细信息”
+            if ENABLE_BBOX_ANNOTATION and f"{OBSERVER_VEHICLE_NAME}_bbox" in csv_writers and enc_client is not None:
+                try:
+                    # 获取相机信息与FOV
+                    cam_info = enc_client.simGetCameraInfo(OBSERVER_CAMERA_NAME, vehicle_name=OBSERVER_VEHICLE_NAME)
+                    camera_pose = cam_info.pose
+                    current_fov = None
+                    try:
+                        if hasattr(cam_info, 'fov') and cam_info.fov:
+                            current_fov = float(cam_info.fov)
+                    except Exception:
+                        current_fov = None
+                    if not current_fov:
+                        current_fov = OBSERVER_FOV_MAX
+
+                    # 获取图像尺寸（优先从当前帧）
+                    if frame_data is not None and isinstance(frame_data, dict) and 'rgb' in frame_data and frame_data['rgb'] is not None:
+                        img_h, img_w = frame_data['rgb'].shape[:2]
+                    else:
+                        img_w, img_h = 1280, 720
+
+                    # 收集无人机位姿
+                    drone_poses = []
+                    for v in VEHICLES:
+                        try:
+                            pose = enc_client.simGetVehiclePose(vehicle_name=v)
+                            drone_poses.append((v, pose))
+                        except Exception:
+                            pass
+
+                    # 群体动力学
+                    poses_only = [p for (_, p) in drone_poses]
+                    swarm_dynamics = compute_swarm_dynamics(poses_only)
+
+                    # 组装bbox行
+                    bbox_row = [
+                        ts_utc, ts_ms, ts_us, frame_idx,
+                        swarm_dynamics.get('center', (0,0,0))[0],
+                        swarm_dynamics.get('center', (0,0,0))[1],
+                        swarm_dynamics.get('center', (0,0,0))[2],
+                        swarm_dynamics.get('radius', 0),
+                        swarm_dynamics.get('dispersion', 0),
+                        swarm_dynamics.get('density', 0),
+                        swarm_dynamics.get('num_drones', 0),
+                        swarm_dynamics.get('min_distance', 0),
+                        swarm_dynamics.get('max_distance', 0),
+                        swarm_dynamics.get('avg_distance', 0)
+                    ]
+
+                    for v in VEHICLES:
+                        # 查找位姿
+                        drone_pose = None
+                        for name, pose in drone_poses:
+                            if name == v:
+                                drone_pose = pose
+                                break
+                        if drone_pose is None:
+                            bbox_row.extend([-1, -1, -1, -1, 0.0, 0.0, 0.0, 0.0, 0.0])
+                            continue
+
+                        world_pos = (drone_pose.position.x_val, drone_pose.position.y_val, drone_pose.position.z_val)
+                        bbox_2d, visibility, distance = project_3d_to_2d_bbox(world_pos, DRONE_BBOX_SIZE, camera_pose, current_fov, img_w, img_h)
+                        if bbox_2d:
+                            bbox_row.extend([bbox_2d[0], bbox_2d[1], bbox_2d[2], bbox_2d[3], visibility, distance, world_pos[0], world_pos[1], world_pos[2]])
+                        else:
+                            bbox_row.extend([-1, -1, -1, -1, 0.0, distance, world_pos[0], world_pos[1], world_pos[2]])
+
+                    csv_writers[f"{OBSERVER_VEHICLE_NAME}_bbox"].writerow(bbox_row)
+                    # 定期flush
+                    key = f"{OBSERVER_VEHICLE_NAME}_bbox"
+                    if key in csv_files and frame_idx % 60 == 0:
+                        try:
+                            csv_files[key].flush()
+                        except Exception:
+                            pass
+                except Exception as e:
+                    print(f"Observer per-frame bbox write error at frame {frame_idx}: {e}")
 
         frame_idx += 1
         # 固定节拍输出
@@ -1098,9 +1198,15 @@ def follow_paths_and_capture(duration_seconds):
     last_tick_time = time.time()
     last_frames = {v: None for v in VEHICLES}
     last_frames[OBSERVER_VEHICLE_NAME] = None
+    # 缓存每个无人机的上一行传感器数据（用于CFR补帧时复制）
+    last_sensor_rows = {v: None for v in VEHICLES}
 
     while time.time() - start_time < duration_seconds:
         tick_start = time.time()
+        # 统一本帧的时间戳（毫秒/微秒）
+        epoch_ns = time.time_ns()
+        ts_ms_frame = int(epoch_ns // 1_000_000)
+        ts_us_frame = int(epoch_ns // 1_000)
         # 构建多模态图像采集请求
         requests = [airsim.ImageRequest(CAM_IDX, airsim.ImageType.Scene, pixels_as_float=False, compress=False)]
         if ENABLE_DRONE_DEPTH_SEGMENTATION:
@@ -1139,7 +1245,8 @@ def follow_paths_and_capture(duration_seconds):
 
             utc_now = datetime.datetime.now(datetime.timezone.utc)
             ts_utc = utc_now.isoformat()
-            ts_ms = int(utc_now.timestamp() * 1000)
+            ts_ms = ts_ms_frame
+            ts_us = ts_us_frame
 
             # 保存多模态图像数据并写入视频
             if img_resp and img_resp[0]:
@@ -1192,7 +1299,7 @@ def follow_paths_and_capture(duration_seconds):
 
             # 记录CSV（对未取样传感器使用 NaN 占位，避免 NoneType 访问）
             row = [
-                ts_utc, ts_ms, frame_idx,
+                ts_utc, ts_ms, ts_us, frame_idx,
                 state.kinematics_estimated.position.x_val, state.kinematics_estimated.position.y_val, state.kinematics_estimated.position.z_val,
                 state.kinematics_estimated.orientation.w_val, state.kinematics_estimated.orientation.x_val, state.kinematics_estimated.orientation.y_val, state.kinematics_estimated.orientation.z_val,
                 (gps.gnss.geo_point.latitude if gps else float('nan')),
@@ -1212,6 +1319,16 @@ def follow_paths_and_capture(duration_seconds):
             ]
             if v in csv_writers:
                 csv_writers[v].writerow(row)
+                # 缓存本行用于CFR补帧（除时间戳和frame_idx外的传感器数据）
+                if v not in last_sensor_rows:
+                    last_sensor_rows[v] = {}
+                last_sensor_rows[v] = row[4:]  # 保存位置、姿态、GPS、IMU等所有传感器数据
+                # 降低缓存风险：每隔30帧刷新一次
+                if frame_idx % 30 == 0 and v in csv_files:
+                    try:
+                        csv_files[v].flush()
+                    except Exception:
+                        pass
 
         # 写入 Observer 视频与时间戳（如启用）
         if (observer_resp and observer_resp[0]) and (not OBSERVER_DEDICATED_THREAD):
@@ -1226,26 +1343,33 @@ def follow_paths_and_capture(duration_seconds):
             if (OBSERVER_VEHICLE_NAME in csv_writers):
                 utc_now = datetime.datetime.now(datetime.timezone.utc)
                 ts_utc = utc_now.isoformat()
-                ts_ms = int(utc_now.timestamp() * 1000)
-                csv_writers[OBSERVER_VEHICLE_NAME].writerow([ts_utc, ts_ms, frame_idx])
+                epoch_ns2 = time.time_ns()
+                ts_ms2 = int(epoch_ns2 // 1_000_000)
+                ts_us2 = int(epoch_ns2 // 1_000)
+                csv_writers[OBSERVER_VEHICLE_NAME].writerow([ts_utc, ts_ms2, ts_us2, frame_idx])
+                if OBSERVER_VEHICLE_NAME in csv_files and frame_idx % 60 == 0:
+                    try:
+                        csv_files[OBSERVER_VEHICLE_NAME].flush()
+                    except Exception:
+                        pass
                 
-        # 计算并记录边界框标注（用于目标检测训练）
+        # ===== 边界框标注已迁移到 _observer_encode_loop 进行逐帧写入 =====
+        # 不再在主循环中写入bbox，避免与encode线程的frame_idx冲突
+        # (原有逻辑已注释，所有bbox写入现在由Observer编码线程统一处理)
+        """
+        # 原有主循环bbox写入逻辑（已禁用）
         if ENABLE_OBSERVER_CAMERA and ENABLE_BBOX_ANNOTATION and (frame_idx % BBOX_LOG_EVERY_N == 0):
             try:
-                # 获取Observer摄像头的位姿信息
-                observer_pose = client.simGetVehiclePose(vehicle_name=OBSERVER_VEHICLE_NAME)
                 observer_camera_info = client.simGetCameraInfo(OBSERVER_CAMERA_NAME, vehicle_name=OBSERVER_VEHICLE_NAME)
+                camera_pose = observer_camera_info.pose
                 
-                # 获取图像尺寸（如果有的话）
                 if OBSERVER_VEHICLE_NAME in video_writers:
                     writer = video_writers[OBSERVER_VEHICLE_NAME]
-                    # 从VideoWriter获取尺寸有点复杂，我们使用配置的尺寸
-                    img_width = 1280  # 从settings.json配置
+                    img_width = 1280
                     img_height = 720
                 else:
                     img_width, img_height = 1280, 720
                 
-                # 获取当前所有无人机的位姿
                 drone_poses = []
                 for v in VEHICLES:
                     try:
@@ -1254,14 +1378,13 @@ def follow_paths_and_capture(duration_seconds):
                     except Exception:
                         pass
                 
-                # 计算集群动力学特征
                 poses_only = [pose for _, pose in drone_poses]
                 swarm_dynamics = compute_swarm_dynamics(poses_only)
                 
-                # 构建边界框标注行
                 bbox_row = [
                     datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                    int(time.time() * 1000),
+                    ts_ms_frame,
+                    ts_us_frame,
                     frame_idx,
                     swarm_dynamics.get('center', (0,0,0))[0],
                     swarm_dynamics.get('center', (0,0,0))[1], 
@@ -1275,10 +1398,15 @@ def follow_paths_and_capture(duration_seconds):
                     swarm_dynamics.get('avg_distance', 0)
                 ]
                 
-                # 为每架无人机计算2D边界框
-                current_fov = obs_fov_deg if obs_fov_deg else OBSERVER_FOV_MAX
+                current_fov = None
+                try:
+                    if hasattr(observer_camera_info, 'fov') and observer_camera_info.fov:
+                        current_fov = float(observer_camera_info.fov)
+                except Exception:
+                    current_fov = None
+                if not current_fov:
+                    current_fov = obs_fov_deg if obs_fov_deg else OBSERVER_FOV_MAX
                 for v in VEHICLES:
-                    # 查找对应的位姿信息
                     drone_pose = None
                     for drone_name, pose in drone_poses:
                         if drone_name == v:
@@ -1288,29 +1416,32 @@ def follow_paths_and_capture(duration_seconds):
                     if drone_pose:
                         world_pos = (drone_pose.position.x_val, drone_pose.position.y_val, drone_pose.position.z_val)
                         bbox_2d, visibility, distance = project_3d_to_2d_bbox(
-                            world_pos, DRONE_BBOX_SIZE, observer_pose, current_fov, img_width, img_height
+                            world_pos, DRONE_BBOX_SIZE, camera_pose, current_fov, img_width, img_height
                         )
                         
                         if bbox_2d:
                             bbox_row.extend([
-                                bbox_2d[0], bbox_2d[1], bbox_2d[2], bbox_2d[3],  # x_min, y_min, x_max, y_max
+                                bbox_2d[0], bbox_2d[1], bbox_2d[2], bbox_2d[3],
                                 visibility, distance,
-                                world_pos[0], world_pos[1], world_pos[2]  # 世界坐标
+                                world_pos[0], world_pos[1], world_pos[2]
                             ])
                         else:
-                            # 无人机不在视野内
                             bbox_row.extend([-1, -1, -1, -1, 0.0, distance, world_pos[0], world_pos[1], world_pos[2]])
                     else:
-                        # 无法获取位姿信息
                         bbox_row.extend([-1, -1, -1, -1, 0.0, 0.0, 0.0, 0.0, 0.0])
                 
-                # 写入边界框标注CSV
                 bbox_writer_key = f"{OBSERVER_VEHICLE_NAME}_bbox"
                 if bbox_writer_key in csv_writers:
                     csv_writers[bbox_writer_key].writerow(bbox_row)
+                    if bbox_writer_key in csv_files:
+                        try:
+                            csv_files[bbox_writer_key].flush()
+                        except Exception:
+                            pass
                     
             except Exception as e:
                 print(f"Bbox annotation error at frame {frame_idx}: {e}")
+        """
 
         # 动态计算目标点，实现复杂运动
         for v in VEHICLES:
@@ -1318,7 +1449,7 @@ def follow_paths_and_capture(duration_seconds):
             idx = (frame_idx + abs(hash(v))) % len(PATHS[v])
             next_pos = PATHS[v][idx]
             
-            # === 拦截场景特化的机动动作 ===
+            # === 拦截场景特化的机动动作(并行发送命令) ===
             elapsed_time = time.time() - start_time
             
             # Drone1: 规避机动 - 随机急转弯和突然加减速
@@ -1340,17 +1471,32 @@ def follow_paths_and_capture(duration_seconds):
             # Drone2: 拦截者 - 高速直线冲刺和悬停
             elif v == "Drone2":
                 if frame_idx % 100 == 0:  # 每5秒一次拦截冲刺
-                    # 计算目标方向(朝向集群中心)
-                    center, _ = compute_swarm_center_and_radius([client.simGetVehiclePose(vehicle_name=vv) for vv in VEHICLES if vv != v])
-                    current_pos = client.simGetVehiclePose(vehicle_name=v).position
-                    dx = center[0] - current_pos.x_val
-                    dy = center[1] - current_pos.y_val
-                    norm = math.sqrt(dx**2 + dy**2)
-                    if norm > 0:
-                        intercept_speed = 20.0  # 拦截速度
-                        vx = intercept_speed * dx / norm
-                        vy = intercept_speed * dy / norm
-                        client.moveByVelocityAsync(vx, vy, -2, 3.0, vehicle_name=v)  # 3秒冲刺
+                    # 计算目标方向(朝向集群中心) - 使用已获取的state数据而非额外RPC
+                    try:
+                        positions = []
+                        for vv in VEHICLES:
+                            if vv != v and vv in future_responses:
+                                resp_state = future_responses[vv]["state"]
+                                positions.append((
+                                    resp_state.kinematics_estimated.position.x_val,
+                                    resp_state.kinematics_estimated.position.y_val,
+                                    resp_state.kinematics_estimated.position.z_val
+                                ))
+                        if positions:
+                            center = tuple(sum(x)/len(positions) for x in zip(*positions))
+                            current_pos = future_responses[v]["state"].kinematics_estimated.position
+                            dx = center[0] - current_pos.x_val
+                            dy = center[1] - current_pos.y_val
+                            norm = math.sqrt(dx**2 + dy**2)
+                            if norm > 0:
+                                intercept_speed = 20.0  # 拦截速度
+                                vx = intercept_speed * dx / norm
+                                vy = intercept_speed * dy / norm
+                                client.moveByVelocityAsync(vx, vy, -2, 3.0, vehicle_name=v)
+                        else:
+                            client.moveToPositionAsync(next_pos[0], next_pos[1], next_pos[2], FLIGHT_SPEED * 1.5, vehicle_name=v)
+                    except Exception:
+                        client.moveToPositionAsync(next_pos[0], next_pos[1], next_pos[2], FLIGHT_SPEED * 1.5, vehicle_name=v)
                 elif frame_idx % 100 == 80:  # 冲刺后短暂悬停
                     client.hoverAsync(vehicle_name=v)
                 else:
@@ -1407,17 +1553,37 @@ def follow_paths_and_capture(duration_seconds):
             now = time.time()
             loop_dt = now - last_tick_time
             dup = int(round(loop_dt / dt)) - 1
+            
             if dup > 0:
                 dup = min(dup, MAX_DUP_FRAMES_PER_TICK)
                 for _ in range(dup):
+                    # 为补帧生成新的时间戳，复制上一帧图像和传感器数据
+                    epoch_ns_dup = time.time_ns()
+                    ts_ms_dup = int(epoch_ns_dup // 1_000_000)
+                    ts_us_dup = int(epoch_ns_dup // 1_000)
+                    ts_utc_dup = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    
                     for v in VEHICLES:
+                        # 复制视频帧
                         lf = last_frames.get(v)
                         if lf is not None and v in video_writers:
                             video_writers[v].write(lf)
+                        
+                        # 复制传感器CSV行（使用缓存的传感器数据 + 新时间戳）
+                        if v in csv_writers and last_sensor_rows.get(v) is not None:
+                            dup_row = [ts_utc_dup, ts_ms_dup, ts_us_dup, frame_idx] + list(last_sensor_rows[v])
+                            csv_writers[v].writerow(dup_row)
+                    
+                    # Observer补帧
                     if ENABLE_OBSERVER_CAMERA and SAVE_OBSERVER_VIDEO and (not OBSERVER_DEDICATED_THREAD):
                         lf = last_frames.get(OBSERVER_VEHICLE_NAME)
                         if lf is not None and OBSERVER_VEHICLE_NAME in video_writers:
                             video_writers[OBSERVER_VEHICLE_NAME].write(lf)
+                        if OBSERVER_VEHICLE_NAME in csv_writers:
+                            csv_writers[OBSERVER_VEHICLE_NAME].writerow([ts_utc_dup, ts_ms_dup, ts_us_dup, frame_idx])
+                    
+                    frame_idx += 1
+            # 无论是否补帧，都更新last_tick_time为当前时间
             last_tick_time = now
 
         frame_idx += 1
@@ -1427,15 +1593,39 @@ def follow_paths_and_capture(duration_seconds):
             time.sleep(sleep_time)
         else:
             print("Warning: Loop is running slower than target FPS.")
+    
+    # 循环结束，关闭文件句柄
+    print(f"Recording completed. Total frames captured: {frame_idx}")
+    for v in video_writers:
+        video_writers[v].release()
+    for v in csv_files:
+        csv_files[v].close()
+    
+    print("All files closed successfully.")
 
 def landing_and_cleanup():
     print("Landing all drones...")
-    land_futures = [client.landAsync(vehicle_name=v) for v in VEHICLES]
-    for i, f in enumerate(land_futures):
-        f.join()
-        print(f"[{VEHICLES[i]}] has landed.")
-        client.armDisarm(False, vehicle_name=VEHICLES[i])
-        client.enableApiControl(False, vehicle_name=VEHICLES[i])
+    # 使用简单的time.sleep等待,避免IOLoop冲突
+    for v in VEHICLES:
+        try:
+            client.landAsync(vehicle_name=v)
+            print(f"[{v}] landing command sent.")
+        except Exception as e:
+            print(f"[{v}] landing failed: {e}")
+    
+    # 等待所有无人机降落(简单延迟)
+    print("Waiting for drones to land...")
+    time.sleep(5)
+    
+    # 解除武装
+    for v in VEHICLES:
+        try:
+            client.armDisarm(False, vehicle_name=v)
+            client.enableApiControl(False, vehicle_name=v)
+            print(f"[{v}] disarmed and API control disabled.")
+        except Exception as e:
+            print(f"[{v}] cleanup failed: {e}")
+    
     print("All drones landed and disarmed.")
 
 if __name__ == "__main__":
@@ -1478,13 +1668,16 @@ if __name__ == "__main__":
                 print(f"Observer size probe failed: {e}")
         
         initialize_recorders(img_size=(img_width, img_height), observer_img_size=observer_size)
-        # 启动Observer专用录制线程（如启用）
-        start_observer_pipeline()
 
         arm_and_takeoff()
+        # 起飞后再启动Observer专用录制线程，减小起始时间差
+        start_observer_pipeline()
         follow_paths_and_capture(duration_seconds=args.duration)
     except Exception as e:
+        import traceback
         print(f"An error occurred: {e}")
+        print("完整错误堆栈:")
+        traceback.print_exc()
     finally:
         # 先停止Observer线程，避免与降落并发RPC导致 IOLoop 冲突
         stop_observer_pipeline()

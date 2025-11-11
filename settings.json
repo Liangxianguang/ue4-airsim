@@ -104,7 +104,9 @@
       "Cameras": {
         "Camera0": {
           "CaptureSettings": [
-            { "ImageType": 0, "Width": 1280, "Height": 720, "FOV_Degrees": 100 }
+            { "ImageType": 0, "Width": 1280, "Height": 720, "FOV_Degrees": 100 }, 
+            { "ImageType": 1, "Width": 1280, "Height": 720, "FOV_Degrees": 100 }, 
+            { "ImageType": 2, "Width": 1280, "Height": 720, "FOV_Degrees": 100 }
           ],
           "X": 0,
           "Y": 0,
