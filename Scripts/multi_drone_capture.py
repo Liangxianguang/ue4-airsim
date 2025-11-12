@@ -402,35 +402,44 @@ def update_observer_camera_stable(client, vehicles, strength=2.0):
         in_ground_phase = elapsed < OBSERVER_PHASE_SWITCH_SEC
         
         if in_ground_phase:
-            # 地面/水平观察阶段：低高度、水平距离较近、接近水平俯视角
-            horiz_dist = float(OBSERVER_GROUND_DIST)  # ~10m
-            height = float(OBSERVER_GROUND_HEIGHT)     # ~2m
-            # 水平视角 (约 -10 度，稍微向下看起飞区域)
-            target_pitch_offset = -math.radians(10)
+            # 地面/水平观察阶段：相机在地面附近，观察起飞
+            # 关键：在 NED 坐标系中，Z=0 是地面，Z<0 是空中
+            # 我们希望相机接近地面（Z 接近 0），而集群在空中（Z < 0）
+            horiz_dist = float(OBSERVER_GROUND_DIST)  # ~10m 水平距离
+            # 相机高度：从地面算起的高度（绝对高度）
+            camera_absolute_height = OBSERVER_GROUND_HEIGHT  # 2m 高度
+            # 在 NED 中，地面上 2m 的 Z 坐标是 -2
+            camera_z_absolute = -camera_absolute_height
         else:
-            # 空中观察阶段：高度较高、固定远距离、按集群位置动态俯视
+            # 空中观察阶段：相机在集群上方
             horiz_dist = float(OBSERVER_FIXED_DIST)
-            height = float(OBSERVER_FIXED_HEIGHT)
-            target_pitch_offset = None  # 后续根据动态计算
+            # 相机在集群上方 OBSERVER_FIXED_HEIGHT 米
+            camera_z_absolute = swarm_center_ema[2] - OBSERVER_FIXED_HEIGHT
         
-        # 目标位置（固定偏移）
+        # 目标位置
         target_pos = (
             swarm_center_ema[0] - horiz_dist, 
             swarm_center_ema[1], 
-            swarm_center_ema[2] - height
+            camera_z_absolute  # 使用绝对 Z 坐标
         )
 
-        # 目标朝向（指向集群中心）
+        # 目标朝向（指向集群中心）- 对于地面和空中阶段都动态计算
         dir_x = swarm_center_ema[0] - target_pos[0]
         dir_y = swarm_center_ema[1] - target_pos[1]
         dir_z = swarm_center_ema[2] - target_pos[2]
         target_yaw = math.atan2(dir_y, dir_x)
         
-        # 目标俯仰角：地面阶段使用固定偏移，空中阶段根据视角计算
-        if in_ground_phase:
-            target_pitch = target_pitch_offset
-        else:
-            target_pitch = -math.atan2(dir_z, math.hypot(dir_x, dir_y))
+        # 目标俯仰角：两个阶段都动态计算，确保始终指向集群中心
+        # 在 NED 坐标系中：
+        #   - 相机在 (x, y, z_cam)，集群在 (x', y', z_swarm)
+        #   - dir_z = z_swarm - z_cam
+        #   - 如果 z_cam < z_swarm (相机在更高处/Z更小)，dir_z > 0，需要向下看
+        #   - 如果 z_cam > z_swarm (相机在更低处/Z更大)，dir_z < 0，需要向上看
+        # 在 AirSim pitch 约定中：pitch < 0 向下，pitch > 0 向上
+        # 因此：target_pitch = atan2(-dir_z, horizontal_dist)
+        #   当 dir_z > 0 时，pitch < 0（向下），正确
+        #   当 dir_z < 0 时，pitch > 0（向上），正确
+        target_pitch = math.atan2(-dir_z, math.hypot(dir_x, dir_y))
 
         # 初始化位置（首次设置）
         if obs_cam_pos is None:
@@ -471,8 +480,8 @@ def update_observer_camera_stable(client, vehicles, strength=2.0):
 
 # 为每架机分配不同轨迹 - 针对拦截场景优化
 PATHS = {
-    "Drone1": generate_path("evasive", center=(8, 0), radius=15, alt=FLIGHT_ALT, num_points=80),      # 规避机动
-    "Drone2": generate_path("intercept", center=(0, 8), radius=20, alt=FLIGHT_ALT, num_points=60),    # 拦截轨迹  
+    "Drone1": generate_path("evasive", center=(8, 0), radius=10, alt=FLIGHT_ALT, num_points=80),      # 规避机动
+    "Drone2": generate_path("intercept", center=(0, 8), radius=15, alt=FLIGHT_ALT, num_points=60),    # 拦截轨迹  
     "Drone3": generate_path("combat_turn", center=(-5, 8), radius=15, alt=FLIGHT_ALT, num_points=70), # 战斗转弯
     "Drone4": generate_path("swarm_break", center=(8, -5), radius=10, alt=FLIGHT_ALT, num_points=60)  # 编队解散
 }
